@@ -187,14 +187,15 @@ func (b *Book) RegisterVersion(req RegisterRequest) error {
 	}
 
 	// 全部校验通过后才提交变更。
+	// 结束时间复制保存：登记完成后，调用方再改写请求中的时间变量不会改变账本。
 	v := &version{
 		itemID:    req.ItemID,
 		versionID: req.VersionID,
 		unitPrice: req.UnitPrice,
 		start:     req.Start,
-		end:       req.End,
+		end:       cloneTime(req.End),
 		replaces:  req.Replaces,
-		effEnd:    req.End,
+		effEnd:    cloneTime(req.End),
 	}
 	if target != nil {
 		truncated := req.Start
@@ -219,6 +220,16 @@ func (b *Book) versionInOtherItem(itemID, versionID string) bool {
 		}
 	}
 	return false
+}
+
+// cloneTime 返回 t 的独立副本；t 为 nil 时返回 nil。
+// 账本保存自己的时间副本，与调用方持有的时间变量互不影响。
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	return &c
 }
 
 // intervalsOverlap 判断半开区间 [s1,e1) 与 [s2,e2) 是否重叠，nil 终点表示持续有效。
@@ -249,11 +260,11 @@ func (b *Book) ItemVersions(itemID string) ([]VersionView, error) {
 			VersionID:      v.versionID,
 			UnitPrice:      v.unitPrice,
 			Start:          v.start,
-			End:            v.end,
+			End:            cloneTime(v.end),
 			Replaces:       v.replaces,
 			SupersededBy:   v.supersededBy,
 			EffectiveStart: v.start,
-			EffectiveEnd:   v.effEnd,
+			EffectiveEnd:   cloneTime(v.effEnd),
 		})
 	}
 	sort.Slice(views, func(i, j int) bool {
