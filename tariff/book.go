@@ -186,15 +186,17 @@ func (b *Book) RegisterVersion(req RegisterRequest) error {
 		}
 	}
 
-	// 全部校验通过后才提交变更。
+	// 全部校验通过后才提交变更。结束时刻必须复制后入库：
+	// 既不能与调用方的请求变量共享指针，登记结束与实际结束之间也互为独立副本，
+	// 外部对原变量或任一返回结果的修改都不能改写账本中的边界。
 	v := &version{
 		itemID:    req.ItemID,
 		versionID: req.VersionID,
 		unitPrice: req.UnitPrice,
 		start:     req.Start,
-		end:       req.End,
+		end:       cloneTimePtr(req.End),
 		replaces:  req.Replaces,
-		effEnd:    req.End,
+		effEnd:    cloneTimePtr(req.End),
 	}
 	if target != nil {
 		truncated := req.Start
@@ -219,6 +221,17 @@ func (b *Book) versionInOtherItem(itemID, versionID string) bool {
 		}
 	}
 	return false
+}
+
+// cloneTimePtr 返回结束时刻的独立副本，nil 原样返回。
+// time.Time 是值类型，但账本持有的是 *time.Time，必须复制指针指向的值，
+// 否则调用方修改自己的时间变量就会改写账本。
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
 }
 
 // intervalsOverlap 判断半开区间 [s1,e1) 与 [s2,e2) 是否重叠，nil 终点表示持续有效。
@@ -249,11 +262,11 @@ func (b *Book) ItemVersions(itemID string) ([]VersionView, error) {
 			VersionID:      v.versionID,
 			UnitPrice:      v.unitPrice,
 			Start:          v.start,
-			End:            v.end,
+			End:            cloneTimePtr(v.end),
 			Replaces:       v.replaces,
 			SupersededBy:   v.supersededBy,
 			EffectiveStart: v.start,
-			EffectiveEnd:   v.effEnd,
+			EffectiveEnd:   cloneTimePtr(v.effEnd),
 		})
 	}
 	sort.Slice(views, func(i, j int) bool {

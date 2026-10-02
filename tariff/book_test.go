@@ -498,3 +498,241 @@ func TestItemNotFound(t *testing.T) {
 		t.Fatalf("want ErrItemNotFound, got %v", err)
 	}
 }
+
+// 登记成功后，调用方复用并改写原请求中的结束时间，不能影响账本。
+func TestRegisterEndImmuneToRequestMutation(t *testing.T) {
+	now, setNow := fixedClock(at(0))
+	b := NewBook(WithClock(now))
+
+	end := at(10)
+	req := RegisterRequest{ItemID: "seat", VersionID: "old", UnitPrice: 100, Start: at(0), End: &end}
+	if err := b.RegisterVersion(req); err != nil {
+		t.Fatal(err)
+	}
+	// 旧版十点结束，新版十点开始（相邻交接）
+	if err := b.RegisterVersion(RegisterRequest{ItemID: "seat", VersionID: "new", UnitPrice: 200, Start: at(10)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把原请求中的结束时刻改晚到十二点
+	*req.End = at(12)
+	views, err := b.ItemVersions("seat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range views {
+		if v.VersionID != "old" {
+			continue
+		}
+		if v.End == nil || !v.End.Equal(at(10)) {
+			t.Fatalf("registered end changed by request mutation: %v", v.End)
+		}
+		if v.EffectiveEnd == nil || !v.EffectiveEnd.Equal(at(10)) {
+			t.Fatalf("effective end changed by request mutation: %v", v.EffectiveEnd)
+		}
+	}
+	// 十一点旧版仍不可报价，新版可以——不能出现两版同时有效
+	setNow(at(11))
+	out, _ := b.Quote(QuoteRequest{RequestID: "q-old", ItemID: "seat", VersionID: "old", Quantity: 1})
+	if out.Confirmed || out.Reason != ReasonVersionExpired {
+		t.Fatalf("old version must still expire at 10: %+v", out)
+	}
+	out, _ = b.Quote(QuoteRequest{RequestID: "q-new", ItemID: "seat", VersionID: "new", Quantity: 1})
+	if !out.Confirmed {
+		t.Fatalf("new version should be quotable at 11: %+v", out)
+	}
+
+	// 改早到八点也不能让已登记版本提前到期
+	*req.End = at(8)
+	views, _ = b.ItemVersions("seat")
+	if views[0].End == nil || !views[0].End.Equal(at(10)) {
+		t.Fatalf("registered end moved earlier by request mutation: %v", views[0].End)
+	}
+}
+
+// 查询返回的登记结束时间与实际结束时间可被调用方随意修改，但账本不变。
+func TestQueryMutationDoesNotChangeLedger(t *testing.T) {
+	now, setNow := fixedClock(at(0))
+	b := NewBook(WithClock(now))
+	must := func(r RegisterRequest) {
+		t.Helper()
+		if err := b.RegisterVersion(r); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	must(RegisterRequest{ItemID: "seat", VersionID: "old", UnitPrice: 100, Start: at(0), End: atPtr(100)})
+	must(RegisterRequest{ItemID: "seat", VersionID: "new", UnitPrice: 200, Start: at(40), Replaces: "old"})
+
+	first, err := b.ItemVersions("seat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// old 的登记结束为 100，实际结束被截断到 40
+	var old, nv *VersionView
+	for i := range first {
+		switch first[i].VersionID {
+		case "old":
+			old = &first[i]
+		case "new":
+			nv = &first[i]
+		}
+	}
+	if old.End == nil || !old.End.Equal(at(100)) || old.EffectiveEnd == nil || !old.EffectiveEnd.Equal(at(40)) {
+		t.Fatalf("unexpected old view: %+v", old)
+	}
+	if nv.End != nil || nv.EffectiveEnd != nil {
+		t.Fatalf("new should be open-ended: %+v", nv)
+	}
+
+	// 调用方为展示目的改写这份查询结果
+	*old.End = at(99)
+	*old.EffectiveEnd = at(98)
+	twelve := at(12)
+	nv.End = &twelve
+	nv.EffectiveEnd = &twelve
+
+	// 再次查询仍是账本中的真实边界
+	second, err := b.ItemVersions("seat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old2, nv2 *VersionView
+	for i := range second {
+		switch second[i].VersionID {
+		case "old":
+			old2 = &second[i]
+		case "new":
+			nv2 = &second[i]
+		}
+	}
+	if old2.End == nil || !old2.End.Equal(at(100)) {
+		t.Fatalf("registered end changed through query mutation: %v", old2.End)
+	}
+	if old2.EffectiveEnd == nil || !old2.EffectiveEnd.Equal(at(40)) {
+		t.Fatalf("effective end changed through query mutation: %v", old2.EffectiveEnd)
+	}
+	if nv2.End != nil || nv2.EffectiveEnd != nil {
+		t.Fatalf("open-ended version got an end through another view: %+v", nv2)
+	}
+
+	// 第一份结果内部：登记结束与实际结束即使值相同，修改一项也不连带另一项
+	equalEnd := at(100)
+	must(RegisterRequest{ItemID: "hall", VersionID: "v", UnitPrice: 1, Start: at(0), End: &equalEnd})
+	h1, _ := b.ItemVersions("hall")
+	h2, _ := b.ItemVersions("hall")
+	if h1[0].End == h1[0].EffectiveEnd {
+		t.Fatal("registered end and effective end share one pointer")
+	}
+	if h1[0].End == h2[0].End {
+		t.Fatal("separate queries share the registered-end pointer")
+	}
+	if h1[0].EffectiveEnd == h2[0].EffectiveEnd {
+		t.Fatal("separate queries share the effective-end pointer")
+	}
+	*h1[0].End = at(50)
+	if !h1[0].EffectiveEnd.Equal(at(100)) {
+		t.Fatalf("editing registered end leaked to effective end: %v", h1[0].EffectiveEnd)
+	}
+	if !h2[0].End.Equal(at(100)) {
+		t.Fatalf("editing one query result leaked to another: %v", h2[0].End)
+	}
+
+	// 报价仍按真实区间处理：40 起 old 已失效
+	setNow(at(45))
+	out, _ := b.Quote(QuoteRequest{RequestID: "q-old", ItemID: "seat", VersionID: "old", Quantity: 1})
+	if out.Confirmed || out.Reason != ReasonVersionExpired {
+		t.Fatalf("quote must use ledger boundary: %+v", out)
+	}
+}
+
+// 外部修改旧版或新版查询中的时间，不得改变替代交接点；新版到期后旧版不恢复生效。
+func TestReplacementHandoffImmuneToViewMutation(t *testing.T) {
+	now, setNow := fixedClock(at(0))
+	b := NewBook(WithClock(now))
+	must := func(r RegisterRequest) {
+		t.Helper()
+		if err := b.RegisterVersion(r); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	must(RegisterRequest{ItemID: "seat", VersionID: "old", UnitPrice: 1, Start: at(0), End: atPtr(100)})
+	must(RegisterRequest{ItemID: "seat", VersionID: "new", UnitPrice: 1, Start: at(40), End: atPtr(60), Replaces: "old"})
+
+	views, _ := b.ItemVersions("seat")
+	for i := range views {
+		if views[i].VersionID == "old" {
+			*views[i].End = at(1000)
+			*views[i].EffectiveEnd = at(1000)
+		}
+		if views[i].VersionID == "new" {
+			*views[i].End = at(1000)
+			*views[i].EffectiveEnd = at(1000)
+		}
+	}
+
+	again, _ := b.ItemVersions("seat")
+	for _, v := range again {
+		switch v.VersionID {
+		case "old":
+			if v.End == nil || !v.End.Equal(at(100)) {
+				t.Fatalf("old registered end changed: %v", v.End)
+			}
+			if v.EffectiveEnd == nil || !v.EffectiveEnd.Equal(at(40)) {
+				t.Fatalf("handoff point changed: %v", v.EffectiveEnd)
+			}
+		case "new":
+			if v.End == nil || !v.End.Equal(at(60)) {
+				t.Fatalf("new registered end changed: %v", v.End)
+			}
+			if v.EffectiveEnd == nil || !v.EffectiveEnd.Equal(at(60)) {
+				t.Fatalf("new effective end changed: %v", v.EffectiveEnd)
+			}
+		}
+	}
+
+	// 新版到期后，旧版仍止于交接点，不能恢复生效
+	setNow(at(70))
+	out, _ := b.Quote(QuoteRequest{RequestID: "q-old", ItemID: "seat", VersionID: "old", Quantity: 1})
+	if out.Confirmed || out.Reason != ReasonVersionExpired {
+		t.Fatalf("superseded old must not revive: %+v", out)
+	}
+}
+
+// 未提供结束时间且未被替代的版本持续有效，两种结束时间都为空；
+// 之后被替代，登记结束仍为空，实际结束显示交接点。
+func TestOpenEndedKeepsNilRegisteredEnd(t *testing.T) {
+	b := NewBook()
+	must := func(r RegisterRequest) {
+		t.Helper()
+		if err := b.RegisterVersion(r); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	must(RegisterRequest{ItemID: "seat", VersionID: "old", UnitPrice: 1, Start: at(0)})
+	views, _ := b.ItemVersions("seat")
+	if views[0].End != nil || views[0].EffectiveEnd != nil {
+		t.Fatalf("open-ended version must report nil ends: %+v", views[0])
+	}
+
+	must(RegisterRequest{ItemID: "seat", VersionID: "new", UnitPrice: 1, Start: at(40), Replaces: "old"})
+	views, _ = b.ItemVersions("seat")
+	// 即使调用方给返回结果中的登记结束塞了值，再次查询仍应为 nil
+	for i := range views {
+		if views[i].VersionID == "old" {
+			late := at(99)
+			views[i].End = &late
+			*views[i].EffectiveEnd = at(99)
+		}
+	}
+	again, _ := b.ItemVersions("seat")
+	for _, v := range again {
+		if v.VersionID == "old" {
+			if v.End != nil {
+				t.Fatalf("registered end must stay nil after replacement: %v", v.End)
+			}
+			if v.EffectiveEnd == nil || !v.EffectiveEnd.Equal(at(40)) {
+				t.Fatalf("effective end should show handoff: %v", v.EffectiveEnd)
+			}
+		}
+	}
+}
