@@ -521,3 +521,243 @@ func printOutcome(title string, o tariff.Outcome) {
 - **⑤** 失败的登记没有占用 `seat-v2` 这个版本标识，补上结束时间后沿用同一标识登记成功；v2 的结束与 v3 的开始同为 4 月 1 日零点，端点相接不算重叠。
 - **⑥** 成功后再查询，v1 的**登记结束**仍是 3 月 31 日（登记时填写的值，永不因后续登记改变），而**实际有效结束**变为 3 月 10 日，并出现 v1 `被替代="seat-v2"`、v2 `替代="seat-v1"` 的关系。登记结束和实际有效结束是两个不同含义的字段，不能解释成同一个值。
 - **⑦⑧** 两次报价调用的 `err` 都为 `nil`：⑦ 是受理后的拒绝（`Confirmed=false`、`version_expired`、金额为 0），⑧ 才是确认（180 分 × 4 = 720 分）。报价成功必须以 `Confirmed == true` 为准。
+
+## 连续调整费率时，该替代哪一版
+
+费率连续调整（甲版被乙版替代、乙版又将被丙版替代）时，容易只盯着旧版本**登记时填写的结束时刻** `End` 判断替代关系，结果把**早已被截短的甲版**再次填进 `Replaces`，登记被拒绝。判断该替代哪一版，只能以 `ItemVersions` 返回的**当前实际有效区间**（`EffectiveEnd`）和替代关系（`Replaces` / `SupersededBy`）为准：
+
+- 登记带 `Replaces` 的新版本时，新版本的 `Start` 必须**严格晚于**被替代版本的 `Start`，并且**严格落在该版本当前的实际有效区间内**：即被替代版本的 `EffectiveEnd` 为 `nil`，或 `Start < EffectiveEnd`。
+- `Start` **恰好等于**被替代版本的实际有效结束时刻也会被拒绝（结束时刻不含在有效期内），返回 `tariff.ErrInvalidReplacement`，可用 `errors.Is` 判别。
+- 甲版被乙版替代后，甲版的 `EffectiveEnd` 已截短到乙版的 `Start`，即使甲版登记的 `End` 仍是更晚的日期也不会变。因此在那之后再登记丙版时，**不能因为甲版登记的结束还没到，就把交接时刻视为甲版仍可用**——要替代的是当前实际覆盖该时刻的乙版。识别方法：`被替代（SupersededBy）` 已非空、或 `EffectiveEnd` 已不晚于新 `Start` 的版本，都不能再作为 `Replaces` 的目标。
+- **普通登记允许相邻区间接续，不等于填写 `Replaces` 后允许在旧版结束点替代它**：不填 `Replaces` 时，新版本开始时刻恰好等于另一版本的结束时刻属于半开区间相接、可以登记；但同一时刻若出现在 `Replaces` 关系中，因要求严格落在旧版实际有效期内，会被拒绝。
+- 与其他登记校验失败一样，`ErrInvalidReplacement` 是**调用本身返回错误**：整次登记回滚，新版本不入库、版本标识不被占用，既有的实际结束与替代关系全部不变，修正 `Replaces` 后可沿用同一版本标识重新登记。这与报价的语义不同——报价引用已失效版本时调用的 `err` 为 `nil`，账本正常受理后返回 `Confirmed == false`、`Reason == version_expired` 的拒绝结果；而登记失败没有任何结果被受理，只看返回的 `error` 是否为 `nil`。
+
+### 一次填错被替代版本、改正后成功的完整示例
+
+程序位于 [`examples/chain/main.go`](examples/chain/main.go)，可直接运行：
+
+```bash
+go run ./examples/chain
+```
+
+所有日期均为 2026 年 UTC 零点、结束时刻不含；时间与费率数据全部在代码中给出，并通过公开选项 `tariff.WithClock` 注入时钟，因此无论在哪一天运行，输出都确定、可复现，不依赖阅读当天的日期。生产环境直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一费率项 `seat` 的连续替代）：
+
+1. 甲版 `seat-a`：单价 150 分，2026-03-01 生效，登记结束为 2026-03-31；
+2. 乙版 `seat-b`：单价 180 分，2026-03-10 起替代甲版，登记结束为 2026-03-25——甲版实际有效结束随之截短到 3 月 10 日，但甲版登记的 3 月 31 日原样保留；
+3. 准备登记丙版 `seat-c`：单价 200 分，2026-03-20 开始、2026-03-24 结束。先把被替代版本填成**甲版**：甲版的实际有效期已在 3 月 10 日结束，3 月 20 日不在甲版当前实际有效区间内，返回 `ErrInvalidReplacement`；
+4. 失败后查询：仍只有甲、乙两版，甲版的实际结束与甲→乙替代关系不变，乙版也没有被截短；
+5. 沿用同一标识 `seat-c`，只把被替代版本改为**乙版**（其当前实际有效区间为 [03-10, 03-25)，3 月 20 日在其中），登记成功；
+6. 末尾在另一本独立账本上做边界对照：同一时刻普通登记允许区间相接接续，但作为 `Replaces` 的交接点、恰好等于被替代版本实际结束时仍被拒绝。
+
+```go
+// 命令 chain 是“连续调整费率时该替代哪一版”的完整可运行示例：
+// 同一费率项上甲→乙→丙连续替代，其中丙第一次误把已被乙替代的甲版
+// 填为被替代版本，登记返回 ErrInvalidReplacement；查询确认账本无变化后，
+// 沿用同一丙版标识改填乙版登记成功。程序末尾还用一次独立登记演示：
+// 普通登记允许区间相接（接续），但这不代表可以在旧版实际结束点替代它。
+//
+// 运行：
+//
+//	go run ./examples/chain
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指 2026 年 UTC 零点，结束时刻不含在有效期内。
+var (
+	aStart = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)  // 甲版开始
+	aEnd   = time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC) // 甲版登记结束（不含）
+	bStart = time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC) // 乙版开始、甲→乙交接点
+	bEnd   = time.Date(2026, 3, 25, 0, 0, 0, 0, time.UTC) // 乙版登记结束（不含）
+	cStart = time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC) // 丙版开始、乙→丙交接点
+	cEnd   = time.Date(2026, 3, 24, 0, 0, 0, 0, time.UTC) // 丙版登记结束（不含）
+)
+
+func main() {
+	// 演示时钟：本示例只有登记（RegisterVersion 不读时钟），
+	// 注入时钟只为完整呈现初始化方式，并保证在任何一天运行输出都确定。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now。
+	now := aStart
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	// ① 登记甲版：单价 150 分，2026-03-01 生效，登记结束 2026-03-31（不含）。
+	aRegisteredEnd := aEnd
+	must(book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-a",
+		UnitPrice: 150,
+		Start:     aStart,
+		End:       &aRegisteredEnd,
+	}))
+
+	// ② 登记乙版：单价 180 分，2026-03-10 起替代甲版，登记结束 2026-03-25（不含）。
+	//    登记成功后甲版的实际有效结束被截短到 3 月 10 日，但甲版登记的结束 3 月 31 日
+	//    仍原样保留——这两个“结束”不是同一个字段，连续调费极易在这里误判该替代谁。
+	bRegisteredEnd := bEnd
+	must(book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-b",
+		UnitPrice: 180,
+		Start:     bStart,
+		End:       &bRegisteredEnd,
+		Replaces:  "seat-a",
+	}))
+	printViews(book, "①② 甲、乙两版登记完成后的版本视图")
+
+	// ③ 准备登记丙版：单价 200 分，2026-03-20 开始、2026-03-24 结束（均不含端点）。
+	//    误填 Replaces 为甲版：甲版登记的结束虽仍是 3 月 31 日，
+	//    但它的实际有效期已在 3 月 10 日乙版接手时结束，3 月 20 日不在甲版当前的
+	//    实际有效区间内，因此这次登记返回 ErrInvalidReplacement。
+	cRegisteredEnd := cEnd
+	err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-c",
+		UnitPrice: 200,
+		Start:     cStart,
+		End:       &cRegisteredEnd,
+		Replaces:  "seat-a",
+	})
+	fmt.Printf("③ 登记丙版（200 分，03-20 起，误填被替代版本=甲版）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrInvalidReplacement) = %v\n",
+		errors.Is(err, tariff.ErrInvalidReplacement))
+	fmt.Println("   登记失败是调用本身返回错误：丙版不入库、标识不被占用，与报价受理后的拒绝不同")
+
+	// ④ 失败后查询：仍然只有甲、乙两版。
+	//    甲版实际结束仍为 3 月 10 日、仍显示被乙版替代；乙版没有被截短（实际结束仍是
+	//    登记时填的 3 月 25 日），也没有出现丙版——整次登记已完全回滚。
+	printViews(book, "④ 失败后的版本视图（仍只有甲、乙两版，关系与边界均不变）")
+
+	// ⑤ 沿用同一个版本标识 seat-c，只把被替代版本改为当前实际生效的乙版。
+	//    乙版当前实际有效区间是 [03-10, 03-25)，3 月 20 日落在其中，因此登记成功；
+	//    失败的登记不占用版本标识。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-c",
+		UnitPrice: 200,
+		Start:     cStart,
+		End:       &cRegisteredEnd,
+		Replaces:  "seat-b",
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("⑤ 沿用标识 seat-c、被替代版本改为乙版再次登记：err=<nil>，登记生效")
+
+	// ⑥ 成功后的视图：
+	//    乙版“替代”甲版、又“被替代”丙版；实际有效结束被截短到 3 月 20 日，
+	//    但它登记时填写的结束 3 月 25 日仍原样保留；
+	//    甲版被乙版替代的第一次交接关系继续保留，实际结束仍为 3 月 10 日、登记结束仍为 3 月 31 日。
+	printViews(book, "⑥ 丙版登记成功后的版本视图（乙版一肩挑两头，登记结束仍为 03-25）")
+
+	// ⑦ 边界：普通登记中相邻区间允许接续，不代表可以在旧版结束点替代它。
+	//    另起一本独立账本，登记一条 [03-10, 03-20) 的版本（不填 Replaces）：
+	//    它与乙版登记的区间端点相接、互不重叠，这是普通登记允许的“接续”。
+	//    但同样是 3 月 20 日这个时刻，若用它在 Replaces 中替代实际有效结束为
+	//    3 月 20 日的版本，校验要求 Start 严格早于被替代版本的实际结束，
+	//    恰好等于实际结束时刻会以 ErrInvalidReplacement 拒绝。
+	fmt.Println("⑦ 边界对照：普通登记允许相接接续，但替代时刻恰好等于实际结束会被拒绝")
+	book2 := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+	dEnd1 := time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC)
+	must(book2.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-d",
+		UnitPrice: 180,
+		Start:     bStart,
+		End:       &dEnd1,
+	}))
+	eEnd := time.Date(2026, 3, 25, 0, 0, 0, 0, time.UTC)
+	if err := book2.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-e",
+		UnitPrice: 200,
+		Start:     cStart, // 2026-03-20 00:00 = seat-d 的实际结束时刻
+		End:       &eEnd,
+		Replaces:  "seat-d",
+	}); err != nil {
+		fmt.Printf("   在实际结束点 03-20 替代 d 版：err=%v\n", err)
+		fmt.Printf("   errors.Is(err, tariff.ErrInvalidReplacement) = %v：端点相接可普通接续，但不能在结束点替代\n",
+			errors.Is(err, tariff.ErrInvalidReplacement))
+	} else {
+		panic("expected ErrInvalidReplacement when replacing exactly at effective end")
+	}
+	// 同一时刻不填 Replaces 做普通登记则成功：一个版本的结束与另一个版本的开始
+	// 落在同一瞬间属于相接，半开区间下不算重叠。
+	if err := book2.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-f",
+		UnitPrice: 200,
+		Start:     cStart,
+		End:       &eEnd,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("   同一时刻不填 Replaces 普通登记 seat-f：err=<nil>，端点相接允许接续")
+	printViews(book2, "   边界对照账本视图")
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func printViews(book *tariff.Book, title string) {
+	fmt.Printf("%s：\n", title)
+	views, err := book.ItemVersions("seat")
+	must(err)
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 开始=%s 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice, v.Start.Format(time.RFC3339),
+			fmtEnd(v.End), fmtEnd(v.EffectiveEnd), v.Replaces, v.SupersededBy)
+	}
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+```
+
+输出（由代码中给出的确定时间产生，不依赖运行当天的日期）：
+
+```text
+①② 甲、乙两版登记完成后的版本视图：
+   seat-a：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="seat-b"
+   seat-b：单价=180 开始=2026-03-10T00:00:00Z 登记结束=2026-03-25T00:00:00Z 实际有效结束=2026-03-25T00:00:00Z 替代="seat-a" 被替代=""
+③ 登记丙版（200 分，03-20 起，误填被替代版本=甲版）：err=tariff: new version start must be after the replaced version start and within its current effective interval
+   errors.Is(err, tariff.ErrInvalidReplacement) = true
+   登记失败是调用本身返回错误：丙版不入库、标识不被占用，与报价受理后的拒绝不同
+④ 失败后的版本视图（仍只有甲、乙两版，关系与边界均不变）：
+   seat-a：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="seat-b"
+   seat-b：单价=180 开始=2026-03-10T00:00:00Z 登记结束=2026-03-25T00:00:00Z 实际有效结束=2026-03-25T00:00:00Z 替代="seat-a" 被替代=""
+⑤ 沿用标识 seat-c、被替代版本改为乙版再次登记：err=<nil>，登记生效
+⑥ 丙版登记成功后的版本视图（乙版一肩挑两头，登记结束仍为 03-25）：
+   seat-a：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="seat-b"
+   seat-b：单价=180 开始=2026-03-10T00:00:00Z 登记结束=2026-03-25T00:00:00Z 实际有效结束=2026-03-20T00:00:00Z 替代="seat-a" 被替代="seat-c"
+   seat-c：单价=200 开始=2026-03-20T00:00:00Z 登记结束=2026-03-24T00:00:00Z 实际有效结束=2026-03-24T00:00:00Z 替代="seat-b" 被替代=""
+⑦ 边界对照：普通登记允许相接接续，但替代时刻恰好等于实际结束会被拒绝
+   在实际结束点 03-20 替代 d 版：err=tariff: new version start must be after the replaced version start and within its current effective interval
+   errors.Is(err, tariff.ErrInvalidReplacement) = true：端点相接可普通接续，但不能在结束点替代
+   同一时刻不填 Replaces 普通登记 seat-f：err=<nil>，端点相接允许接续
+   边界对照账本视图：
+   seat-d：单价=180 开始=2026-03-10T00:00:00Z 登记结束=2026-03-20T00:00:00Z 实际有效结束=2026-03-20T00:00:00Z 替代="" 被替代=""
+   seat-f：单价=200 开始=2026-03-20T00:00:00Z 登记结束=2026-03-25T00:00:00Z 实际有效结束=2026-03-25T00:00:00Z 替代="" 被替代=""
+```
+
+对照输出即可判断连续调费时该替代哪一版：
+
+- **②之后**：甲版的登记结束仍是 3 月 31 日，但实际有效结束已是 3 月 10 日、`被替代="seat-b"`。3 月 20 日当前实际生效的是乙版 [03-10, 03-25)，该被丙版替代的是乙版。
+- **③** 返回非空错误且 `errors.Is(.., tariff.ErrInvalidReplacement)` 为真：甲版的实际有效期已在 3 月 10 日结束，不能凭它登记的结束仍是 3 月 31 日，就把 3 月 20 日当作甲版可用的替代时刻。
+- **④** 失败后的查询与操作前完全一致：仍只有甲、乙两版；甲版实际结束 3 月 10 日和甲→乙替代关系没有变化，乙版的实际结束仍是登记时填写的 3 月 25 日、没有被这次失败登记截短，丙版不存在，`seat-c` 标识也未被占用。
+- **⑤⑥** 沿用同一标识只改 `Replaces` 后登记成功：乙版同时呈现 `替代="seat-a"` 与 `被替代="seat-c"`，实际有效结束变为 3 月 20 日，而它登记时填写的结束 3 月 25 日仍原样保留；甲版被乙版替代的第一次交接关系继续保留，甲版两个结束字段（登记 3 月 31 日、实际 3 月 10 日）都不变。
+- **⑦** 交接点必须严格落在被替代版本的当前实际有效期内：新 `Start` 晚于被替代版本 `Start`、且早于其 `EffectiveEnd`，恰好等于实际结束时刻也返回 `ErrInvalidReplacement`。同一时刻不填 `Replaces` 的普通登记允许区间相接接续——两条规则各管各的场景，不能互相套用。
+- **③是调用错误，不是受理后的拒绝**：登记失败时只有返回的 `error`，账本状态完全不变；这不同于报价引用失效版本时 `err == nil`、`Outcome.Confirmed == false`（`version_expired`）的正常受理后拒绝。
