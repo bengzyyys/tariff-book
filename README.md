@@ -4,6 +4,7 @@
 
 - 按费率项登记带整数分单价、生效起点和结束时刻（不含）的费率版本；
 - 登记一个**替代旧版本**的新版本，账本自动把旧版本的实际有效期截断到交接时刻；
+- 登记替代版本时，新版本**自身的有效期**不能侵入同费率项其他版本的实际有效时间，否则返回 `tariff.ErrOverlap` 且整次登记不生效（见下文“登记替代版本”一节）；
 - 在指定时刻对指定版本报价，得到**首次受理结果**（确认并给出单价、总价，或带原因拒绝）；
 - 按请求标识进行幂等重试和事后查询——费率变化后可据此核对一笔报价应沿用原请求标识还是发起新报价。
 
@@ -56,6 +57,216 @@ go test ./...
 ### 结果只在当前账本实例内
 
 报价记录保存在当前 `Book` 实例的内存中。重新 `NewBook()` 得到的是一本空账本，之前的标识全部查不到——不要假设跨实例仍能查询历史结果。
+
+## 登记替代版本：一次失败、修正后成功
+
+准备登记一个替代旧版本的新版本时，要特别注意：**旧版本可以被截短，并不代表新版本可以占用同一费率项其他版本的有效时间。**
+
+重叠校验针对的是账本里**除被替代者之外**的所有版本，比较依据是各方的实际有效区间。新版本登记时若不填结束时间，就表示它持续有效——这会一直延伸到同费率项里排在后面的版本区间内。登记失败时账本不做任何部分提交，调用方应当：
+
+1. 检查 `RegisterVersion` 返回的错误（用 `errors.Is(err, tariff.ErrOverlap)` 判断），**返回错误即说明登记没有生效**；
+2. 通过 `ItemVersions` 查询确认账本状态没有变化（没有新版本、没有新的替代关系、旧版本的两种结束时间都未改变）；
+3. 修正请求后**沿用同一个版本标识**重新登记——失败的登记不会占用版本标识。
+4. 半开区间在同一时刻相接（前者结束时刻 = 后者开始时刻）不算重叠，因为结束时刻不含。
+
+下面的完整程序位于 [`examples/register_alt/main.go`](examples/register_alt/main.go)，可直接运行：
+
+```bash
+go run ./examples/register_alt
+```
+
+时间线（同一费率项 `seat`，下述日期均指 UTC 零点，结束时刻不含）：先登记 `seat-v1`，单价 150 分，2026-03-01 生效、登记结束 3 月 31 日；再登记 `seat-v3`，单价 200 分，2026-04-01 起持续有效。然后尝试登记 `seat-v2`，单价 180 分，3 月 10 日起替代 v1 但**不填结束时间**——它会延续到 v3 的有效时间内，返回 `ErrOverlap`。把结束时间改为 4 月 1 日后沿用 `seat-v2` 标识再次登记，即成功。最后把报价受理时刻设为 3 月 10 日，用各自的新请求标识、数量 4 分别引用 v1 和 v2。
+
+```go
+// 命令 register_alt 演示“登记替代费率版本”时一次失败、修正后成功的完整过程，
+// 以及登记返回错误与报价受理后被拒绝之间的区别。
+//
+// 运行：
+//
+//	go run ./examples/register_alt
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+func main() {
+	// 下述日期均指 UTC 零点，结束时刻不含。
+	// 演示时钟：报价受理时刻从变量 now 读取，因此无论哪天运行，输出都确定、可复现。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now。
+	var now time.Time
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	v1Start := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	v1End := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	v2Start := time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)
+	v2End := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	v3Start := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+
+	// ① 先登记 seat-v1：单价 150 分，2026-03-01 生效，登记结束为 2026-03-31（不含）。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 150,
+		Start:     v1Start,
+		End:       &v1End,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("① 登记 seat-v1：150 分，2026-03-01 起，登记结束 2026-03-31（不含）：成功")
+
+	// ② 再登记 seat-v3：单价 200 分，2026-04-01 起持续有效（不填结束时间）。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v3",
+		UnitPrice: 200,
+		Start:     v3Start,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("② 登记 seat-v3：200 分，2026-04-01 起持续有效（不填结束）：成功")
+
+	// ③ 尝试登记 seat-v2：单价 180 分，2026-03-10 起替代 seat-v1，但不填结束时间。
+	//    seat-v1 虽然会被截短到 3 月 10 日，seat-v2 本身却会持续有效，
+	//    延伸进 seat-v3 自 4 月 1 日起的有效时间，因此与同费率项的另一个版本重叠。
+	err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		Replaces:  "seat-v1",
+		// End 故意留空：nil 表示持续有效
+	})
+	fmt.Printf("③ seat-v2（180 分，3 月 10 日起替代 v1，不填结束）登记结果：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrOverlap)=%v —— 返回错误即说明本次登记没有生效\n",
+		errors.Is(err, tariff.ErrOverlap))
+
+	// ④ 失败后立即查询：账本里仍只有 v1、v3 两个版本。
+	//    v1 的登记结束仍是 3 月 31 日、实际结束也仍是 3 月 31 日，
+	//    不存在被 v2 替代的关系；v3 完全不受影响。
+	printViews("④ 登记失败后查询 seat 的版本（应仍只有两个，且无任何替代关系）", book)
+
+	// ⑤ 沿用 seat-v2 这个版本标识，把结束时间改为 2026-04-01（不含）再次登记。
+	//    失败的登记不占用版本标识；v2 的结束时刻与 v3 的开始时刻同为 4 月 1 日零点，
+	//    两端半开区间在这一点相接，互不重叠。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		End:       &v2End,
+		Replaces:  "seat-v1",
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Printf("⑤ 沿用 seat-v2 标识、补上结束 %s（不含）再次登记：成功（err=<nil>）\n",
+		v2End.Format(time.RFC3339))
+
+	// ⑥ 成功后查询：注意 v1 的“登记结束”仍是 3 月 31 日（永不改变），
+	//    而“实际有效结束”被截短到 3 月 10 日；v1 被 v2 替代，v2 替代 v1。
+	printViews("⑥ 登记成功后查询 seat 的版本（三个版本，v1 已被截短并与 v2 相接）", book)
+
+	// 报价受理时刻设为 2026-03-10 00:00（UTC 零点）：
+	// 这正是 v1 实际有效区间的结束点（不含），也是 v2 有效区间的起点（含）。
+	now = v2Start
+
+	// ⑦ 用全新请求标识、数量 4 引用 seat-v1。调用 err 为 nil（报价已受理），
+	//    但 Confirmed=false、原因 version_expired —— 受理后拒绝，不是调用错误。
+	expired, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-v1-at-handoff",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑦ 3 月 10 日用新标识引用 seat-v1（quote-v1-at-handoff，数量 4）", expired)
+	fmt.Printf("   err==nil 但 Confirmed=%v、原因=%s —— 这是“受理后拒绝”，与③的登记返回错误不是一回事\n",
+		expired.Confirmed, expired.Reason)
+
+	// ⑧ 另一个全新请求标识、数量 4 引用 seat-v2：按 180 分确认，总价 720 分。
+	confirmed, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-v2-at-handoff",
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑧ 3 月 10 日用新标识引用 seat-v2（quote-v2-at-handoff，数量 4）", confirmed)
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+
+func printViews(title string, b *tariff.Book) {
+	fmt.Printf("%s：\n", title)
+	views, err := b.ItemVersions("seat")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("   版本数量=%d\n", len(views))
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 分 生效=%s 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice, v.Start.Format(time.RFC3339),
+			fmtEnd(v.End), fmtEnd(v.EffectiveEnd), v.Replaces, v.SupersededBy)
+	}
+}
+
+func printOutcome(title string, o tariff.Outcome) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   请求 item=%s version=%s 数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	if o.Confirmed {
+		fmt.Printf("   结果=已确认 单价=%d 分 总价=%d 分\n", o.UnitPrice, o.Total)
+	} else {
+		fmt.Printf("   结果=被拒绝 原因=%s（err 为 nil，拒绝不是调用错误）\n", o.Reason)
+	}
+}
+```
+
+输出（受理时刻由示例时钟设定，不依赖运行当天的日期）：
+
+```text
+① 登记 seat-v1：150 分，2026-03-01 起，登记结束 2026-03-31（不含）：成功
+② 登记 seat-v3：200 分，2026-04-01 起持续有效（不填结束）：成功
+③ seat-v2（180 分，3 月 10 日起替代 v1，不填结束）登记结果：err=tariff: version interval overlaps an existing version of the item
+   errors.Is(err, tariff.ErrOverlap)=true —— 返回错误即说明本次登记没有生效
+④ 登记失败后查询 seat 的版本（应仍只有两个，且无任何替代关系）：
+   版本数量=2
+   seat-v1：单价=150 分 生效=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+   seat-v3：单价=200 分 生效=2026-04-01T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+⑤ 沿用 seat-v2 标识、补上结束 2026-04-01T00:00:00Z（不含）再次登记：成功（err=<nil>）
+⑥ 登记成功后查询 seat 的版本（三个版本，v1 已被截短并与 v2 相接）：
+   版本数量=3
+   seat-v1：单价=150 分 生效=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="seat-v2"
+   seat-v2：单价=180 分 生效=2026-03-10T00:00:00Z 登记结束=2026-04-01T00:00:00Z 实际有效结束=2026-04-01T00:00:00Z 替代="seat-v1" 被替代=""
+   seat-v3：单价=200 分 生效=2026-04-01T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+⑦ 3 月 10 日用新标识引用 seat-v1（quote-v1-at-handoff，数量 4）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-10T00:00:00Z
+   结果=被拒绝 原因=version_expired（err 为 nil，拒绝不是调用错误）
+   err==nil 但 Confirmed=false、原因=version_expired —— 这是“受理后拒绝”，与③的登记返回错误不是一回事
+⑧ 3 月 10 日用新标识引用 seat-v2（quote-v2-at-handoff，数量 4）：
+   请求 item=seat version=seat-v2 数量=4；首次受理时刻=2026-03-10T00:00:00Z
+   结果=已确认 单价=180 分 总价=720 分
+```
+
+对照输出可确认三件事：
+
+- **如何判断登记是否生效**：③的 `RegisterVersion` 返回非空错误（`ErrOverlap`），④的查询里没有 `seat-v2`、v1 的两种结束时间都仍是 3 月 31 日且没有替代关系——错误返回加查询未变，二者一致才说明失败被正确识别；⑤返回 `err=<nil>` 且⑥出现三个版本，才是登记生效。
+- **登记结束 ≠ 实际有效结束**：⑥里 v1 的登记结束仍为 3 月 31 日（登记时填写的值，永不改变），实际有效结束则是 3 月 10 日（被 v2 截断的交接点），同时 v1 显示被 `seat-v2` 替代、v2 显示替代 `seat-v1`。这两个值不能合并理解。
+- **登记错误 ≠ 报价拒绝**：③是登记阶段返回错误，账本无变更；⑦是报价已受理（`err == nil`）后因 `version_expired` 拒绝（`Confirmed=false`），二者不能混为一谈——报价成功必须同时满足 `err == nil` **且** `Confirmed == true`，如⑧按 180 分确认总价 720 分。
 
 ## 完整示例
 
