@@ -24,9 +24,10 @@ var (
 
 // 查询与报价时可能返回的错误。
 var (
-	ErrItemNotFound      = errors.New("tariff: rate item not found")
-	ErrRequestNotFound   = errors.New("tariff: request id not found")
-	ErrRequestIDConflict = errors.New("tariff: request id already used with different content")
+	ErrItemNotFound       = errors.New("tariff: rate item not found")
+	ErrNoEffectiveVersion = errors.New("tariff: no version of the rate item is effective at the given time")
+	ErrRequestNotFound    = errors.New("tariff: request id not found")
+	ErrRequestIDConflict  = errors.New("tariff: request id already used with different content")
 )
 
 // RejectReason 区分报价被拒绝的原因。
@@ -257,17 +258,7 @@ func (b *Book) ItemVersions(itemID string) ([]VersionView, error) {
 	}
 	views := make([]VersionView, 0, len(versions))
 	for _, v := range versions {
-		views = append(views, VersionView{
-			ItemID:         v.itemID,
-			VersionID:      v.versionID,
-			UnitPrice:      v.unitPrice,
-			Start:          v.start,
-			End:            cloneTimePtr(v.end),
-			Replaces:       v.replaces,
-			SupersededBy:   v.supersededBy,
-			EffectiveStart: v.start,
-			EffectiveEnd:   cloneTimePtr(v.effEnd),
-		})
+		views = append(views, toViewLocked(v))
 	}
 	sort.Slice(views, func(i, j int) bool {
 		if !views[i].EffectiveStart.Equal(views[j].EffectiveStart) {
@@ -276,6 +267,63 @@ func (b *Book) ItemVersions(itemID string) ([]VersionView, error) {
 		return views[i].VersionID < views[j].VersionID
 	})
 	return views, nil
+}
+
+// EffectiveVersion 返回指定费率项在 at 这一瞬间生效的单个版本。
+//
+// 选择依据是查询时账本中该费率项已登记的实际有效区间
+// [EffectiveStart, EffectiveEnd)：开始时刻包含在内，结束时刻不包含在内，
+// EffectiveEnd 为 nil 表示持续有效。被替代而提前结束的旧版本在交接时刻
+// 起不可选，即使登记结束仍在将来；替代它的新版本到期后也不会回退到旧版本。
+//
+// at 是调用方明确指定的时刻，可以是过去或未来，比较按实际时刻进行，
+// 不同时区表示同一瞬间时结论一致。查询只读取版本信息：费率项存在但该时刻
+// 落在首版开始之前或两版之间的空档时返回 ErrNoEffectiveVersion；
+// 费率项从未登记过则返回 ErrItemNotFound，调用方可区分这两种失败。
+//
+// 返回的版本视图与 ItemVersions 中的各项相互独立，调用方修改其中的
+// 结束时间不会改变账本，也不影响后续报价。
+func (b *Book) EffectiveVersion(itemID string, at time.Time) (VersionView, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	versions, ok := b.items[itemID]
+	if !ok || len(versions) == 0 {
+		return VersionView{}, ErrItemNotFound
+	}
+	var found *version
+	for _, v := range versions {
+		if at.Before(v.start) {
+			continue
+		}
+		if v.effEnd != nil && !at.Before(*v.effEnd) {
+			continue
+		}
+		// 实际有效区间两两不重叠，至多一个版本命中；命中即返回。
+		found = v
+		break
+	}
+	if found == nil {
+		return VersionView{}, ErrNoEffectiveVersion
+	}
+	return toViewLocked(found), nil
+}
+
+// toViewLocked 在持锁状态下构造一个与账本内部状态完全独立的版本视图。
+// 登记结束与实际结束各自复制一份指针，既不与账本共享，彼此也不共享，
+// 调用方修改返回视图中的任一时间都不能改写账本或同一视图内的另一字段。
+func toViewLocked(v *version) VersionView {
+	return VersionView{
+		ItemID:         v.itemID,
+		VersionID:      v.versionID,
+		UnitPrice:      v.unitPrice,
+		Start:          v.start,
+		End:            cloneTimePtr(v.end),
+		Replaces:       v.replaces,
+		SupersededBy:   v.supersededBy,
+		EffectiveStart: v.start,
+		EffectiveEnd:   cloneTimePtr(v.effEnd),
+	}
 }
 
 // Quote 按首次受理时刻判断指定版本是否有效并给出报价。
