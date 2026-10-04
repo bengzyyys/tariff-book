@@ -98,6 +98,31 @@ type version struct {
 	effEnd       *time.Time
 }
 
+// availability 描述版本在某一瞬间的可用性，是查询与报价共用的唯一判断口径。
+type availability int
+
+const (
+	availabilityEffective availability = iota // 处于实际有效区间内
+	availabilityNotYet                        // 尚未到达生效起点
+	availabilityExpired                       // 已过实际有效终点
+)
+
+// availabilityAt 判断版本在 t 这一瞬间是否处于实际有效区间 [start, effEnd)。
+// 开始时刻包含在内，结束时刻不包含；effEnd 为 nil 表示持续有效。
+// 被替代的版本以截短后的实际结束时刻（effEnd）为准，不看登记时填写的 end。
+// 时间按实际时刻比较，同一瞬间的不同时区表示结论一致。
+// 查询（EffectiveVersionAt）与报价（Quote）都以此为唯一判断，
+// 只是各自传入的瞬间不同：查询用调用方指定的时刻，报价用首次受理时刻。
+func (v *version) availabilityAt(t time.Time) availability {
+	if t.Before(v.start) {
+		return availabilityNotYet
+	}
+	if v.effEnd != nil && !t.Before(*v.effEnd) {
+		return availabilityExpired
+	}
+	return availabilityEffective
+}
+
 // Book 是费率版本与报价的本地账本，可并发使用。
 type Book struct {
 	mu       sync.Mutex
@@ -313,10 +338,7 @@ func (b *Book) EffectiveVersionAt(itemID string, at time.Time) (VersionView, err
 	}
 	var found *version
 	for _, v := range versions {
-		if at.Before(v.start) {
-			continue
-		}
-		if v.effEnd != nil && !at.Before(*v.effEnd) {
+		if v.availabilityAt(at) != availabilityEffective {
 			continue
 		}
 		// 同一费率项内各版本的实际有效区间互不重叠，至多一版命中。
@@ -360,12 +382,18 @@ func (b *Book) Quote(req QuoteRequest) (Outcome, error) {
 		out.Reason = ReasonInvalidQuantity
 	default:
 		v := b.items[req.ItemID][req.VersionID]
+		// 可用性以首次受理时刻为准，与查询共用同一套实际有效期判断；
+		// 只有版本有效后才判断总价是否溢出。
+		var avail availability
+		if v != nil {
+			avail = v.availabilityAt(out.AcceptedAt)
+		}
 		switch {
 		case v == nil:
 			out.Reason = ReasonVersionNotFound
-		case out.AcceptedAt.Before(v.start):
+		case avail == availabilityNotYet:
 			out.Reason = ReasonVersionNotYetEffective
-		case v.effEnd != nil && !out.AcceptedAt.Before(*v.effEnd):
+		case avail == availabilityExpired:
 			out.Reason = ReasonVersionExpired
 		case v.unitPrice > 0 && req.Quantity > math.MaxInt64/v.unitPrice:
 			out.Reason = ReasonTotalOverflow
