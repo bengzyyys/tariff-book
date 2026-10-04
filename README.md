@@ -6,7 +6,8 @@
 - 登记一个**替代旧版本**的新版本，账本自动把旧版本的实际有效期截断到交接时刻；
 - 按费率项和**指定时刻**查询当时生效的单个版本（`EffectiveVersionAt`），选择依据是账本已登记的实际有效区间；
 - 在指定时刻对指定版本报价，得到**首次受理结果**（确认并给出单价、总价，或带原因拒绝）；
-- 按请求标识进行幂等重试和事后查询——费率变化后可据此核对一笔报价应沿用原请求标识还是发起新报价。
+- 按请求标识进行幂等重试和事后查询——费率变化后可据此核对一笔报价应沿用原请求标识还是发起新报价；
+- 也允许事后补登记一个**生效时刻在过去**的替代版本（仍受既有替代与重叠规则约束）：它会改变 `EffectiveVersionAt` 对过去时刻的回答，却不会重算已经确认的报价。
 
 ## 测试
 
@@ -41,6 +42,15 @@ go test ./...
 - `EffectiveEnd`：**实际有效**结束时刻（不含）。当新版本通过 `Replaces` 替代旧版本时，旧版本的实际有效期被截断到新版本的生效时刻，因此 `EffectiveEnd` 可能早于登记的 `End`；旧版本若登记时未给结束时间，`End` 仍为 `nil`，而 `EffectiveEnd` 会显示交接点。
 
 从交接时刻起，旧版本不能再接受新报价（新请求得到 `version_expired` 拒绝），但交接前已经确认的记录不受影响，仍保留原版本、数量、单价、总价和首次受理时刻。旧版本也不会在新版本到期后恢复生效。
+
+交接时刻允许**晚于登记动作本身**——也就是可以事后补登记一个“过去就已生效”的替代版本，只要交接点仍满足现有的替代规则（晚于被替代版本的开始、落在它当时的实际有效区间内）且不与同项其他版本重叠。补登记会把旧版本的实际有效结束**追溯地**提前到交接点。
+
+这时要特别分清一笔报价的“确认时刻”与“后来补登记的交接点”：即使一笔报价的首次受理时刻**晚于**补登记所填的交接点（补登记后看，确认发生时旧版本在当前账本里已经失效），该确认记录也**不会被撤销或重算**——因为报价有效性只在**首次受理的当时**判定一次，结果连同首次受理时刻被冻结保存。改变的只是对版本区间的“现在视角”：
+
+- **按时刻选版**（`EffectiveVersionAt`）依据的是**查询时账本已登记的实际有效区间**。补登记改写了旧版本对过去时刻的实际有效期，所以补登记前后查询**同一个过去时刻**，答案可能从旧版变成新版。
+- **按请求标识取回**（`Lookup` 或原样重试）返回的是**首次受理结果**，与查询时的费率状态无关。补登记不会重算已经确认（或拒绝）的报价。
+
+因此核对一笔历史确认价，永远以按其请求标识保存的首次结果为准；`EffectiveVersionAt` 在同一时刻给出的版本只反映“账本现在怎么看那段过去”，不能用来回溯改价。完整过程见下文[“补登记过去生效的替代版本后，怎样核对已有报价”](#补登记过去生效的替代版本后怎样核对已有报价)一节。
 
 ### 首次拒绝同样幂等
 
@@ -327,6 +337,266 @@ func printOutcome(title string, o tariff.Outcome) {
 ```
 
 对照输出即可区分两类信息：`Lookup`/原样重试取回的是**历史报价结果**（③④仍是 3 月 2 日确认的 600 分），而用新标识当场报价检验的是**当前版本是否有效**（⑤旧版本已失效、⑧新版本有效）。
+
+## 补登记过去生效的替代版本后，怎样核对已有报价
+
+登记替代版本时，交接点（新版本的 `Start`）只要求晚于被替代版本的开始、落在它**当时**的实际有效区间内，并不要求晚于登记动作本身。因此可以在 3 月 15 日补登记一个“3 月 10 日起就已生效”的新版本——只要现有替代规则与重叠规则仍然满足。
+
+补登记一旦成功，会产生两个方向相反、必须分清的效果：
+
+- **按时刻选版会改变对过去的回答**：`EffectiveVersionAt` 依据的是**查询时**账本已登记的实际有效区间。补登记把旧版的实际有效结束追溯地提前到交接点，所以补登记前后查询**同一个过去时刻**，答案可能从旧版变成新版。
+- **按请求标识取回的报价不变**：`Lookup` 与原样重试取回的永远是**首次受理结果**。即使一笔确认的首次受理时刻**晚于**后来补登记的交接点（补登记后回看，确认发生时旧版在当前账本里已失效），该确认也不会被撤销或重算——报价有效性只在首次受理的当时判定一次，金额、来源、首次受理时刻随即冻结。
+
+因此核对历史确认价，要以保存的首次结果为准；想按补登记后的新版重新报价，必须使用**从未使用过的新请求标识**。
+
+### 完整示例
+
+程序位于 [`examples/retroactive/main.go`](examples/retroactive/main.go)，可直接运行：
+
+```bash
+go run ./examples/retroactive
+```
+
+示例自行建立一本新账本，所有日期都明确采用同一时区（UTC）、结束时刻不含，受理时刻通过公开选项 `tariff.WithClock` 固定，不依赖运行当天、也不等待真实时间。生产环境直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一费率项 `seat`）：
+
+1. `seat-v1`：单价 150 分，2026-03-01 起生效，**登记结束**为 2026-03-31；
+2. 2026-03-15 10:00（此时账本中只有旧版）以标识 `retro-quote-001`、数量 4 报价，按旧版确认 150 × 4 = **600 分**；
+3. **时钟仍停在 3 月 15 日 10 点**，补登记 `seat-v2`：单价 180 分，填写 2026-03-10 起替代旧版、不填结束时间，同项没有其他版本与它重叠——交接点早于登记当天，但现有替代规则照样接受；
+4. 补登记前后都查询 3 月 15 日 10 点的生效版本：答案从 `seat-v1` 变为 `seat-v2`；旧版登记结束仍为 3 月 31 日，实际有效结束已提前到 3 月 10 日；
+5. 按原标识 `Lookup` 和原样重试：仍是旧版、数量 4、150 分、600 分、首次受理时刻不变；
+6. 用新标识分别引用旧版与新版：旧版得到 `version_expired` 拒绝（`err` 为空），新版确认 180 × 4 = **720 分**；沿用原标识只把版本改成新版，则返回 `ErrRequestIDConflict`，原 600 分记录保留。
+
+```go
+// 命令 retroactive 是“补登记一个过去就已生效的替代版本后，怎样核对已有报价”
+// 的完整可运行示例：旧版有效期内先确认 600 分报价，随后仍在同一受理时刻
+// 补登 5 天前起替代旧版的新版本；演示按时刻选版的答案随之改变，
+// 而已确认报价按请求标识取回时保持首次结果不变。
+//
+// 运行：
+//
+//	go run ./examples/retroactive
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指同一时区（UTC），结束时刻不含；全部写死，不依赖运行当天。
+var (
+	oldStart   = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)   // 旧版生效
+	oldEnd     = time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)  // 旧版登记结束（不含）
+	handoff    = time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)  // 新版补登的交接点（早于登记时刻）
+	acceptedAt = time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC) // 报价首次受理时刻；补登后时钟也不推进
+)
+
+func main() {
+	// 演示时钟：受理时刻取自变量 now。本例从头到尾停在 2026-03-15 10:00，
+	// 补登发生在“现在”，交接点却在 5 天前——靠的是登记允许补登过去的区间，
+	// 而不是时钟回拨。生产环境直接 tariff.NewBook() 即使用真实的 time.Now；
+	// 这里传入 tariff.WithClock 只是为了让示例输出确定、可复现，无需等待真实时间。
+	now := acceptedAt
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	// 登记旧版本 seat-v1：单价 150 分，2026-03-01 生效，登记结束 2026-03-31（不含）。
+	registeredOldEnd := oldEnd
+	must(book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 150,
+		Start:     oldStart,
+		End:       &registeredOldEnd,
+	}))
+
+	// ① 补登前查询 3 月 15 日 10 点的生效版本：当时账本里只有旧版，答案是 seat-v1。
+	printEffectiveAt(book, "① 补登前：3 月 15 日 10 点的生效版本")
+
+	// ② 同一时刻，用标识 retro-quote-001 按旧版报价，数量 4：
+	//    150 分 × 4 = 600 分，确认。
+	first, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "retro-quote-001",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	must(err)
+	printOutcome("② 旧版有效期内首次报价（retro-quote-001）", first)
+
+	// ③ 时钟仍停在 3 月 15 日 10 点，补登新版本 seat-v2：单价 180 分，
+	//    填写 2026-03-10 00:00 起替代旧版，不填结束时间（持续有效）。
+	//    交接点虽然早于登记当天 5 天，但它晚于旧版开始、且落在旧版当时的
+	//    实际有效期 [03-01, 03-31) 内，同项也没有其他版本与新区间重叠，
+	//    现有替代规则照样接受——补登成功。补登不会撤销或重算②的报价。
+	must(book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     handoff,
+		Replaces:  "seat-v1",
+	}))
+	fmt.Println("③ 仍在 3 月 15 日 10 点补登 seat-v2（交接点填 3 月 10 日，不填结束时间）：err=<nil>，登记生效")
+
+	// ④ 补登后的版本视图：旧版“登记结束”仍是 3 月 31 日（永不改变），
+	//    “实际有效结束”已被提前到 3 月 10 日；新版两栏结束均为空，持续有效。
+	fmt.Println("④ 补登后的版本视图：")
+	views, err := book.ItemVersions("seat")
+	must(err)
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice, fmtEnd(v.End), fmtEnd(v.EffectiveEnd),
+			v.Replaces, v.SupersededBy)
+	}
+
+	// ⑤ 对同一个过去时刻 3 月 15 日 10 点再查一次生效版本：答案从旧版变为新版。
+	//    按时刻选版依据的是“查询时账本已登记的实际有效区间”，补登改写了
+	//    旧版对过去时刻的实际有效期，因此同一时刻的答案随之改变。
+	printEffectiveAt(book, "⑤ 补登后：同一时刻 3 月 15 日 10 点的生效版本")
+
+	// ⑥ 但按请求标识取回的是首次受理结果：Lookup 与原样重试都仍是②——
+	//    旧版、数量 4、单价 150 分、总价 600 分，首次受理时刻保持在 3 月 15 日 10 点，
+	//    确认状态不变。补登不会重算已经确认的报价。
+	got, err := book.Lookup("retro-quote-001")
+	must(err)
+	printOutcome("⑥ 补登后按原标识 Lookup（retro-quote-001）", got)
+	fmt.Printf("   与首次结果完全一致：%v\n", got == first)
+
+	replay, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "retro-quote-001",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	must(err)
+	printOutcome("⑦ 补登后原样重试（retro-quote-001）", replay)
+	fmt.Printf("   与首次结果完全一致：%v\n", replay == first)
+
+	// ⑧ 用新的请求标识、在当前受理时刻引用旧版：调用正常受理（err 为 nil），
+	//    但旧版实际有效结束已提前到 3 月 10 日，结果是 version_expired 拒绝。
+	expired, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "retro-quote-old",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	must(err)
+	printOutcome("⑧ 新标识引用旧版（retro-quote-old）", expired)
+	fmt.Printf("   err=%v（为空）但 Confirmed=%v：这是受理后的拒绝，不是调用错误\n",
+		err, expired.Confirmed)
+
+	// ⑨ 换另一个新标识引用新版：180 分 × 4 = 720 分，确认。
+	fresh, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "retro-quote-new",
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		Quantity:  4,
+	})
+	must(err)
+	printOutcome("⑨ 新标识引用新版（retro-quote-new）", fresh)
+
+	// ⑩ 沿用原标识、只把版本改成新版：请求内容与首次不同，
+	//    返回 ErrRequestIDConflict（调用本身不成立），不产生新报价，也不覆盖原记录。
+	_, err = book.Quote(tariff.QuoteRequest{
+		RequestID: "retro-quote-001",
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		Quantity:  4,
+	})
+	fmt.Printf("⑩ 沿用原标识只把版本改成新版：err=%v（errors.Is(err, tariff.ErrRequestIDConflict)=%v）\n",
+		err, errors.Is(err, tariff.ErrRequestIDConflict))
+	unchanged, err := book.Lookup("retro-quote-001")
+	must(err)
+	fmt.Printf("   原记录保留：Confirmed=%v version=%s 数量=%d 单价=%d 分 总价=%d 分\n",
+		unchanged.Confirmed, unchanged.Request.VersionID, unchanged.Request.Quantity,
+		unchanged.UnitPrice, unchanged.Total)
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+
+func printEffectiveAt(book *tariff.Book, title string) {
+	fmt.Printf("%s：\n", title)
+	v, err := book.EffectiveVersionAt("seat", acceptedAt)
+	must(err)
+	fmt.Printf("   查询时刻=%s → %s：单价=%d 分 实际有效区间=%s\n",
+		acceptedAt.Format(time.RFC3339), v.VersionID, v.UnitPrice,
+		fmtInterval(v.EffectiveStart, v.EffectiveEnd))
+}
+
+// fmtInterval 把半开区间 [start, end) 格式化为确定文本；end 为 nil 表示持续有效。
+func fmtInterval(start time.Time, end *time.Time) string {
+	if end == nil {
+		return start.Format(time.RFC3339) + " 起持续有效"
+	}
+	return "[" + start.Format(time.RFC3339) + ", " + end.Format(time.RFC3339) + ")"
+}
+
+func printOutcome(title string, o tariff.Outcome) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   请求 item=%s version=%s 数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	if o.Confirmed {
+		fmt.Printf("   结果=已确认 单价=%d 分 总价=%d 分\n", o.UnitPrice, o.Total)
+	} else {
+		fmt.Printf("   结果=被拒绝 原因=%s（err 为 nil，拒绝不是调用错误）\n", o.Reason)
+	}
+}
+```
+
+输出（固定日期与受理时刻，不依赖运行当天或真实时间）：
+
+```text
+① 补登前：3 月 15 日 10 点的生效版本：
+   查询时刻=2026-03-15T10:00:00Z → seat-v1：单价=150 分 实际有效区间=[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)
+② 旧版有效期内首次报价（retro-quote-001）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-15T10:00:00Z
+   结果=已确认 单价=150 分 总价=600 分
+③ 仍在 3 月 15 日 10 点补登 seat-v2（交接点填 3 月 10 日，不填结束时间）：err=<nil>，登记生效
+④ 补登后的版本视图：
+   seat-v1：单价=150 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="seat-v2"
+   seat-v2：单价=180 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="seat-v1" 被替代=""
+⑤ 补登后：同一时刻 3 月 15 日 10 点的生效版本：
+   查询时刻=2026-03-15T10:00:00Z → seat-v2：单价=180 分 实际有效区间=2026-03-10T00:00:00Z 起持续有效
+⑥ 补登后按原标识 Lookup（retro-quote-001）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-15T10:00:00Z
+   结果=已确认 单价=150 分 总价=600 分
+   与首次结果完全一致：true
+⑦ 补登后原样重试（retro-quote-001）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-15T10:00:00Z
+   结果=已确认 单价=150 分 总价=600 分
+   与首次结果完全一致：true
+⑧ 新标识引用旧版（retro-quote-old）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-15T10:00:00Z
+   结果=被拒绝 原因=version_expired（err 为 nil，拒绝不是调用错误）
+   err=<nil>（为空）但 Confirmed=false：这是受理后的拒绝，不是调用错误
+⑨ 新标识引用新版（retro-quote-new）：
+   请求 item=seat version=seat-v2 数量=4；首次受理时刻=2026-03-15T10:00:00Z
+   结果=已确认 单价=180 分 总价=720 分
+⑩ 沿用原标识只把版本改成新版：err=tariff: request id already used with different content（errors.Is(err, tariff.ErrRequestIDConflict)=true）
+   原记录保留：Confirmed=true version=seat-v1 数量=4 单价=150 分 总价=600 分
+```
+
+对照输出即可完成核对：
+
+- **①→⑤ 是“按时刻选版”的变化**：同一查询时刻 3 月 15 日 10 点，补登前命中 `seat-v1`，补登后命中 `seat-v2`。④同时显示旧版的**登记结束**仍是 3 月 31 日、**实际有效结束**已提前到 3 月 10 日。这个查询回答的是“账本现在怎么看那段过去”。
+- **⑥⑦ 是“按标识查报价”的不变量**：`retro-quote-001` 取回的永远是②的首次结果——旧版、数量 4、单价 150 分、总价 600 分、首次受理时刻 3 月 15 日 10 点，确认状态保持不变。哪怕这笔确认的受理时刻（3 月 15 日）晚于补登记的交接点（3 月 10 日），也不会被追溯改判。**核对历史确认价应以保存的首次结果为准**，不能用⑤的答案重算。
+- **⑧⑨ 说明重新报价必须用新标识**：补登后当场新报价，引用旧版得到 `version_expired`（⑧，`err` 为空的拒绝），引用新版才确认 720 分（⑨）。
+- **⑩ 与⑧要分开**：沿用原标识改版本是**调用错误** `ErrRequestIDConflict`（没有产生任何结果，原 600 分记录保留）；⑧的 `version_expired` 是 `err == nil` 的正常受理后拒绝。一个标识只能绑定首次请求的内容，想按新版报价只能换新标识。
 
 ## 登记替代版本：旧版能被截短，不代表新版能占用其他版本的时间
 
