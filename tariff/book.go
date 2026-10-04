@@ -247,6 +247,31 @@ func intervalsOverlap(s1 time.Time, e1 *time.Time, s2 time.Time, e2 *time.Time) 
 	return true
 }
 
+// effectiveStatus 描述某一瞬间版本在实际有效区间内的可用状态。
+type effectiveStatus int
+
+const (
+	statusEffective effectiveStatus = iota
+	statusNotYetEffective
+	statusExpired
+)
+
+// effectiveAt 按版本的实际有效区间 [start, effEnd) 判断 at 瞬间是否可用：
+// 开始时刻包含在内，结束时刻不包含，effEnd 为 nil 表示持续有效。
+// 被替代版本的 effEnd 已被截断到交接时刻，因此判断一律以实际有效区间为准，
+// 不使用登记时填写的 end。时间按实际时刻比较，同一瞬间的不同时区表示结论一致。
+// 查询与报价共用这一套判断，只是各自传入自己的时刻。
+func effectiveAt(v *version, at time.Time) effectiveStatus {
+	switch {
+	case at.Before(v.start):
+		return statusNotYetEffective
+	case v.effEnd != nil && !at.Before(*v.effEnd):
+		return statusExpired
+	default:
+		return statusEffective
+	}
+}
+
 // versionView 构造账本版本的独立视图。
 // 结束时刻必须复制后返回：登记结束与实际结束各自生成独立副本，
 // 不同次查询之间也不共享指针，外部对任一返回结果的修改都不能改写账本边界。
@@ -313,10 +338,7 @@ func (b *Book) EffectiveVersionAt(itemID string, at time.Time) (VersionView, err
 	}
 	var found *version
 	for _, v := range versions {
-		if at.Before(v.start) {
-			continue
-		}
-		if v.effEnd != nil && !at.Before(*v.effEnd) {
+		if effectiveAt(v, at) != statusEffective {
 			continue
 		}
 		// 同一费率项内各版本的实际有效区间互不重叠，至多一版命中。
@@ -360,12 +382,16 @@ func (b *Book) Quote(req QuoteRequest) (Outcome, error) {
 		out.Reason = ReasonInvalidQuantity
 	default:
 		v := b.items[req.ItemID][req.VersionID]
+		var status effectiveStatus
+		if v != nil {
+			status = effectiveAt(v, out.AcceptedAt)
+		}
 		switch {
 		case v == nil:
 			out.Reason = ReasonVersionNotFound
-		case out.AcceptedAt.Before(v.start):
+		case status == statusNotYetEffective:
 			out.Reason = ReasonVersionNotYetEffective
-		case v.effEnd != nil && !out.AcceptedAt.Before(*v.effEnd):
+		case status == statusExpired:
 			out.Reason = ReasonVersionExpired
 		case v.unitPrice > 0 && req.Quantity > math.MaxInt64/v.unitPrice:
 			out.Reason = ReasonTotalOverflow
