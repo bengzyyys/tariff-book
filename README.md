@@ -791,6 +791,269 @@ func printOutcome(title string, o tariff.Outcome) {
 - **⑤⑥** 失败的登记不占用 `seat-v3` 标识，改为替代乙版后成功。此时乙版同时显示 `替代="seat-v1"` 和 `被替代="seat-v3"`，实际结束变为 3 月 20 日，而它登记时填写的 3 月 25 日仍然保留；甲版的第一次交接关系（实际结束 3 月 10 日、被乙版替代）也继续保留。
 - **⑦⑧** 两次报价调用的 `err` 都为 `nil`：⑦ 是受理后的拒绝（`version_expired`），⑧ 才是确认（200 分 × 4 = 800 分）。这与 ③ 的调用错误是两类不同的“没成功”。
 
+## 不同费率项使用同名版本时，怎样登记替代版本
+
+版本标识只在**同一费率项内**唯一：两个费率项可以各自登记一个同名版本（如同为 `v1`），跨费率项的有效期重叠也不是冲突。登记替代版本时，`Replaces` 填写的来源**只按本次登记指定的费率项（`ItemID`）在该项内查找**，规则如下：
+
+- 来源在**本项**：只校验、截断本项的那一版。另一项中的同名版本**既不会被替代**（它的单价、登记结束、实际有效结束、替代关系都不变），**也不能替本项的来源通过交接时间校验**——新版本的 `Start` 必须晚于来源开始、且落在**本项来源当前的实际有效区间** `[EffectiveStart, EffectiveEnd)` 内（结束时刻不含，见上一节）。本项来源已被更早的版本截短后，即使另一项的同名版本在该时刻仍有效，交接时刻仍按本项来源判定，不合法就返回 `tariff.ErrInvalidReplacement`，**不能误报成来源属于另一项**（`ErrReplaceTargetWrongItem`）。
+- 来源在**本项找不到、其他费率项却有同名版本**：返回 `tariff.ErrReplaceTargetWrongItem`（可用 `errors.Is` 判别）。账本不会把其他项的同名版本拿来充当来源。
+- **所有费率项都没有**该版本标识：返回 `tariff.ErrReplaceTargetNotFound`。
+
+这三种失败都整次回滚：新版本不入库、版本标识不被占用，本项与其他项的边界、替代关系都不变——**任何一种错误都不会借用其他项的同名版本完成登记**。报价同理：`Quote` 按请求中的费率项加版本定位版本，确认结果的来源（`Outcome.Request`）明确记录费率项与版本，两项即便版本同名，也各按各的单价成交。
+
+### 同名版本跨费率项登记替代的完整示例
+
+程序位于 [`examples/crossitem/main.go`](examples/crossitem/main.go)，可直接运行：
+
+```bash
+go run ./examples/crossitem
+```
+
+所有日期均为 2026 年 UTC 零点、结束时刻不含；账本初始化、费率数据与受理时刻全部在代码中给出，并通过公开选项 `tariff.WithClock` 注入可手动推进的时钟，因此无论在哪一天运行，输出都确定、可复现，不依赖运行当天、也不需要读者补写辅助代码。生产环境直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一本账本中的两个费率项 `seat`、`room`）：
+
+1. `seat/v1` 单价 150 分、`room/v1` 单价 300 分，有效期都登记为 2026-03-01 至 2026-03-31；
+2. 给 `seat` 登记 `v2`：单价 180 分，2026-03-10 起替代 **seat 本项的** `v1`，不填结束时间。截短与替代关系只发生在 seat 的两版之间，room 的同名 `v1` 完全不变；
+3. 受理时刻固定在交接点 2026-03-10 00:00（结束时刻不含该点），各用一个从未使用过的新请求标识、数量 4 分别引用 `seat/v2` 与 `room/v1`：分别确认 720 分与 1200 分，来源写明费率项和版本；
+4. 一次错误的替代登记：给 `seat` 登记 `v3`（单价 200 分，2026-03-20 开始），却仍把 `v1` 填作来源。seat/v1 的实际有效期已被 v2 截断到 3 月 10 日，即使 room/v1 此时仍有效，也返回 `ErrInvalidReplacement`——既不能借 room 的同名版本通过校验，也不能误报来源属于另一项；失败后两项的版本信息都没有变化；
+5. 另补充演示两类来源错误：本项（`hall`，尚未登记）找不到 `v1`、其他项却有同名版本时返回 `ErrReplaceTargetWrongItem`；所有项都没有 `v9` 时返回 `ErrReplaceTargetNotFound`。两次失败都不留痕。
+
+```go
+// 命令 crossitem 是“不同费率项使用同名版本时，怎样登记替代版本”的完整可运行示例：
+// 同一本账本里 seat 与 room 都登记名为 v1 的版本；seat 再登记 v2 替代“本项的”v1，
+// room 的同名 v1 完全不受影响。随后 seat 登记 v3 时误把已被替代的 v1 填作来源，
+// 即使 room/v1 当时仍有效，也返回 ErrInvalidReplacement，不会借用另一项的同名版本。
+//
+// 运行：
+//
+//	go run ./examples/crossitem
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指 UTC 零点，结束时刻不含。
+var (
+	v1Start = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)  // seat/v1、room/v1 同时生效
+	v1End   = time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC) // 两项 v1 的登记结束（不含）
+	v2Start = time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC) // seat/v2 替代本项 v1 的交接点
+	v3Start = time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC) // seat/v3 计划的交接点
+)
+
+func main() {
+	// 演示时钟：受理时刻取自变量 now，推进它即可让同一本账本走到不同时期。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now；
+	// 这里传入 tariff.WithClock 只是为了让示例输出确定、可复现，无需等待真实时间。
+	now := v1Start
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	// ① 登记 seat/v1：单价 150 分，2026-03-01 生效，登记结束 2026-03-31（不含）。
+	seatEnd := v1End
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "v1",
+		UnitPrice: 150,
+		Start:     v1Start,
+		End:       &seatEnd,
+	}); err != nil {
+		panic(err)
+	}
+
+	// ② 同一本账本再登记 room/v1：版本标识同样叫 v1，单价 300 分、有效期完全相同。
+	//    版本标识只在费率项内唯一；跨费率项重名、跨费率项有效期重叠都允许。
+	roomEnd := v1End
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "room",
+		VersionID: "v1",
+		UnitPrice: 300,
+		Start:     v1Start,
+		End:       &roomEnd,
+	}); err != nil {
+		panic(err)
+	}
+	printViews(book, "seat", "①② 两项同名 v1 登记完成后的版本视图（seat）")
+	printViews(book, "room", "   （room）")
+
+	// ③ 给 seat 登记 v2：单价 180 分，2026-03-10 起替代 v1，不填结束时间。
+	//    Replaces 的来源只按“本次登记指定的费率项 seat”查找，截短的是 seat/v1；
+	//    room 下同名的 v1 既不是替代来源，也不参与同项重叠判断，更不会被截断。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		Replaces:  "v1",
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("③ 登记 seat/v2（2026-03-10 起替代 seat 本项的 v1）：err=<nil>，登记生效")
+	printViews(book, "seat", "   seat 版本视图")
+	printViews(book, "room", "   room 版本视图（单价、两种结束时间、替代关系均不变）")
+
+	// ④⑤ 把报价受理时刻推进到交接点 2026-03-10 00:00（结束时刻不含该点），
+	//     两项各用一个从未使用过的新请求标识、数量 4 分别报价。
+	now = v2Start
+
+	seatQuote, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-seat-v2-at-handoff",
+		ItemID:    "seat",
+		VersionID: "v2",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("④ 交接点引用 seat/v2（quote-seat-v2-at-handoff）", seatQuote)
+
+	roomQuote, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-room-v1-at-handoff",
+		ItemID:    "room",
+		VersionID: "v1",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑤ 交接点引用 room/v1（quote-room-v1-at-handoff）", roomQuote)
+
+	// ⑥ 一次错误的替代登记：给 seat 登记 v3（单价 200 分，2026-03-20 开始），
+	//    却仍把 v1 填作替代来源。seat/v1 的实际有效期已被 v2 截断到 3 月 10 日，
+	//    3 月 20 日不在其中——即使 room/v1 此时仍有效，也不能拿另一项的同名版本
+	//    充当来源通过交接时间校验，必须返回 ErrInvalidReplacement；
+	//    来源就在 seat 本项，也不能误报成 ErrReplaceTargetWrongItem。
+	err = book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "v3",
+		UnitPrice: 200,
+		Start:     v3Start,
+		Replaces:  "v1",
+	})
+	fmt.Printf("⑥ 登记 seat/v3（3-20 开始，仍填 v1 为来源）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrInvalidReplacement) = %v\n",
+		errors.Is(err, tariff.ErrInvalidReplacement))
+	fmt.Printf("   errors.Is(err, tariff.ErrReplaceTargetWrongItem) = %v（来源就在 seat 本项，不能误报属于另一项）\n",
+		errors.Is(err, tariff.ErrReplaceTargetWrongItem))
+
+	// ⑦ 失败后查询：seat 仍只有 v1、v2，边界与替代关系与③之后完全一致；
+	//    room 仍是单价 300 分的单个 v1；失败的登记也不占用 v3 标识。
+	printViews(book, "seat", "⑦ 登记失败后的版本视图（seat，应与③完全一致）")
+	printViews(book, "room", "   （room，应与③完全一致）")
+
+	// ⑧ 另一种填法：本项根本没有该来源、只有其他项存在同名版本。
+	//    hall 从未登记过，v1 只存在于 seat、room 中：返回 ErrReplaceTargetWrongItem，
+	//    不会借用其他项的 v1 完成登记。
+	err = book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "hall",
+		VersionID: "v5",
+		UnitPrice: 50,
+		Start:     v3Start,
+		Replaces:  "v1",
+	})
+	fmt.Printf("⑧ hall 登记 v5、来源填 v1（v1 只在 seat、room 中）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrReplaceTargetWrongItem) = %v\n",
+		errors.Is(err, tariff.ErrReplaceTargetWrongItem))
+
+	// ⑨ 所有费率项都没有该标识时：返回 ErrReplaceTargetNotFound。
+	err = book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "hall",
+		VersionID: "v5",
+		UnitPrice: 50,
+		Start:     v3Start,
+		Replaces:  "v9",
+	})
+	fmt.Printf("⑨ hall 登记 v5、来源填 v9（任何项都没有 v9）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrReplaceTargetNotFound) = %v\n",
+		errors.Is(err, tariff.ErrReplaceTargetNotFound))
+
+	// ⑧⑨ 两次失败都不留痕：hall 费率项从未被创建，已有两项也不受影响。
+	if _, err := book.ItemVersions("hall"); err != nil {
+		fmt.Printf("⑩ 两次失败后查询 hall：err=%v（失败登记不创建费率项、不占用版本标识）\n", err)
+	}
+}
+
+func printViews(book *tariff.Book, itemID, title string) {
+	fmt.Printf("%s：\n", title)
+	views, err := book.ItemVersions(itemID)
+	if err != nil {
+		panic(err)
+	}
+	for _, v := range views {
+		fmt.Printf("   %s/%s：单价=%d 开始=%s 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			itemID, v.VersionID, v.UnitPrice, v.Start.Format(time.RFC3339),
+			fmtEnd(v.End), fmtEnd(v.EffectiveEnd), v.Replaces, v.SupersededBy)
+	}
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+
+func printOutcome(title string, o tariff.Outcome) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   来源=费率项 %s / 版本 %s，数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	if o.Confirmed {
+		fmt.Printf("   结果=已确认 单价=%d 分 × 数量 %d = 总价=%d 分\n",
+			o.UnitPrice, o.Request.Quantity, o.Total)
+	} else {
+		fmt.Printf("   结果=被拒绝 原因=%s（err 为 nil，拒绝不是调用错误）\n", o.Reason)
+	}
+}
+```
+
+输出（受理时刻由示例时钟推进到确定值，不依赖运行当天）：
+
+```text
+①② 两项同名 v1 登记完成后的版本视图（seat）：
+   seat/v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+   （room）：
+   room/v1：单价=300 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+③ 登记 seat/v2（2026-03-10 起替代 seat 本项的 v1）：err=<nil>，登记生效
+   seat 版本视图：
+   seat/v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="v2"
+   seat/v2：单价=180 开始=2026-03-10T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="v1" 被替代=""
+   room 版本视图（单价、两种结束时间、替代关系均不变）：
+   room/v1：单价=300 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+④ 交接点引用 seat/v2（quote-seat-v2-at-handoff）：
+   来源=费率项 seat / 版本 v2，数量=4；首次受理时刻=2026-03-10T00:00:00Z
+   结果=已确认 单价=180 分 × 数量 4 = 总价=720 分
+⑤ 交接点引用 room/v1（quote-room-v1-at-handoff）：
+   来源=费率项 room / 版本 v1，数量=4；首次受理时刻=2026-03-10T00:00:00Z
+   结果=已确认 单价=300 分 × 数量 4 = 总价=1200 分
+⑥ 登记 seat/v3（3-20 开始，仍填 v1 为来源）：err=tariff: new version start must be after the replaced version start and within its current effective interval
+   errors.Is(err, tariff.ErrInvalidReplacement) = true
+   errors.Is(err, tariff.ErrReplaceTargetWrongItem) = false（来源就在 seat 本项，不能误报属于另一项）
+⑦ 登记失败后的版本视图（seat，应与③完全一致）：
+   seat/v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代="v2"
+   seat/v2：单价=180 开始=2026-03-10T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="v1" 被替代=""
+   （room，应与③完全一致）：
+   room/v1：单价=300 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+⑧ hall 登记 v5、来源填 v1（v1 只在 seat、room 中）：err=tariff: replaced version belongs to another item
+   errors.Is(err, tariff.ErrReplaceTargetWrongItem) = true
+⑨ hall 登记 v5、来源填 v9（任何项都没有 v9）：err=tariff: replaced version does not exist
+   errors.Is(err, tariff.ErrReplaceTargetNotFound) = true
+⑩ 两次失败后查询 hall：err=tariff: rate item not found（失败登记不创建费率项、不占用版本标识）
+```
+
+对照输出即可判断同名版本会不会互相干扰：
+
+- **①②** `seat/v1` 与 `room/v1` 标识同名、有效期完全重叠，但分属两个费率项，登记互不冲突，单价各是各的（150 分与 300 分）。
+- **③** seat 的替代登记只动本项：seat/v1 的**登记结束**仍是 3 月 31 日、**实际有效结束**变为 3 月 10 日，并出现 v1 `被替代="v2"`、v2 `替代="v1"`；room/v1 的单价、登记结束、实际有效结束和替代关系**全部不变**，也没有冒出 room/v2。
+- **④⑤** 交接时刻两次报价都确认，但金额按各自费率项的版本计算：seat/v2 是 180 分 × 4 = **720 分**，room/v1 是 300 分 × 4 = **1200 分**；来源行明确写出费率项和版本，不会因为同名而串行。
+- **⑥** seat/v3 在 3 月 20 日仍填 `Replaces: "v1"` 时，账本只查 seat 本项的 v1——它的实际有效期已止于 3 月 10 日，故返回 `ErrInvalidReplacement`；room/v1 此刻虽然仍有效，**既不能替 seat/v1 通过交接时间校验，也不会让错误变成 `ErrReplaceTargetWrongItem`**。
+- **⑦** 失败后两项的版本信息与 ③ 之后逐字一致：seat 仍只有 v1、v2 且替代关系保留，room 仍是单价 300 分的单个 v1；失败的登记不占用 `v3` 标识。
+- **⑧⑨⑩** 本项没有来源、其他项有同名版本时是 `ErrReplaceTargetWrongItem`；所有项都没有该标识时是 `ErrReplaceTargetNotFound`。二者都不会借用其他项的版本完成登记，失败后 `hall` 费率项甚至不存在（查询返回 `ErrItemNotFound`），已有两项也不受影响。
+
 ## 补登记过去生效的替代版本后，怎样核对已有报价
 
 交接点可以**早于登记当天**：`RegisterVersion` 不读取账本时钟，替代规则只要求新版本的 `Start` 晚于被替代版本的 `Start`、且落在被替代版本当前的实际有效区间内，并与同项其他版本的实际有效区间不重叠（见上文各节）。因此可以事后补登记一个过去就已生效的替代版本。
