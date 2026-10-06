@@ -545,6 +545,209 @@ func printOutcome(title string, o tariff.Outcome) {
 - **③④⑤** 三笔拒绝的调用错误都是 `nil`，单价和总价都是零：零金额只是“没有可给出的金额”，不代表登记的费率是零（两版单价实际都是 MaxInt64）；也不能仅凭 `err == nil` 当作确认报价，必须检查 `Confirmed`。
 - **⑥** 数量 1 时总价恰好等于有符号 64 位整数最大值，仍可确认——上限本身不是非法金额，只有超过上限才被拒绝。
 
+## 数量填错后怎样重新报价
+
+`Quantity` 必须是**正整数**。使用一个从未用过的非空请求标识首次提交时，若数量为零或负数：
+
+- 调用错误（`error`）为**空**，返回的是一份正常受理但**被拒绝**的结果：`Confirmed == false`、`Reason == invalid_quantity`、单价和总价均为零；
+- 结果仍**原样保留**提交的数量（零就是零、负数不会被改成零）、费率项、版本，以及首次受理时刻。这份首次拒绝与首次确认一样会被保存，之后可按标识 `Lookup` 或原样重试取回。
+
+判断顺序是固定的：**数量问题先于版本问题**。即使指定版本在受理时刻同时尚未生效、已经失效或根本不存在，这种首次请求的原因仍是 `invalid_quantity`，账本不会继续检查版本。因此看到 `invalid_quantity` **不能推断该版本一定可用**（这次受理根本没有判断版本）；结果里的零金额也只是“没有可给出的金额”，**不能理解为免费报价**。要单独验证版本是否可用，需用合法数量、另换标识再报一次（对照见上文 `total_overflow` 一节及 `tariff` 包内的数量优先级测试）。
+
+数量填错后，三步关系要分清：
+
+1. **查询原记录**：`Lookup(原标识)` 取回的就是首次拒绝，原始数量和首次受理时刻不变；
+2. **原样重试**：相同标识、相同内容（含错误数量）再次提交，仍返回同一份首次拒绝，不会按新的当前时刻重新受理；
+3. **重新报价必须换标识**：沿用原标识只把数量改正，属于“相同标识、不同内容”，调用本身返回 `tariff.ErrRequestIDConflict`，**没有可使用的新报价结果**，原拒绝记录也不被覆盖、仍能查到。只有换一个**从未用过的新标识**提交正确数量，才会发起一笔新的首次报价。
+
+换新标识并不会绕开账本的受理规则：它只是发起一笔全新的首次报价，新版本是否有效、金额是否溢出，仍按上文既有的版本有效期与金额规则判断。
+
+### 一次数量填错、查询、冲突、换标识重报的完整示例
+
+程序位于 [`examples/requote/main.go`](examples/requote/main.go)，可直接运行：
+
+```bash
+go run ./examples/requote
+```
+
+所有日期与时刻均为 2026 年 UTC、结束时刻不含；账本初始化、费率登记和受理时刻全部在代码中给出，并通过公开选项 `tariff.WithClock` 注入可手动推进的时钟，因此无论在哪一天运行、处于什么本机时区，输出都确定、可复现，读者无需另外补写初始化代码。生产环境直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一本账本、同一个费率项 `seat` 和版本 `seat-v1`）：
+
+1. 登记 `seat-v1`：单价 150 分，2026-03-01 生效，登记结束为 2026-03-31；
+2. 在明确的受理时刻 2026-03-02 10:00（版本有效期内），用一个非空新标识 `quote-wrong-qty` 提交数量 0，得到 `invalid_quantity` 拒绝；
+3. 把时钟拨到 3 月 3 日后，按该标识 `Lookup`、再原样提交一次，都取回 ② 那份首次拒绝——原数量 0 与首次受理时刻 3 月 2 日 10:00 保持不变；
+4. 只把数量改为 4、沿用原标识提交，返回 `ErrRequestIDConflict`，没有可使用的新报价结果；原拒绝记录仍能查到；
+5. 换成另一个从未用过的标识 `quote-right-qty`，以数量 4 引用同一有效版本，确认单价 150 分、总价 600 分，来源和数量都与这次新请求一致。
+
+```go
+// 命令 requote 是“数量填错后怎样重新报价”的完整可运行示例：
+// 用新标识首次提交数量 0 得到 invalid_quantity 拒绝后，演示查询与原样重试
+// 取回的都是同一份首次拒绝；沿用原标识改数量会得到 ErrRequestIDConflict，
+// 原拒绝不被覆盖；只有换用从未用过的新标识，才会发起一笔新的首次报价。
+//
+// 运行：
+//
+//	go run ./examples/requote
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+func main() {
+	// 演示时钟：受理时刻取自变量 now，推进它即可让同一本账本走到不同时期。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now；
+	// 这里传入 tariff.WithClock 只是为了让示例输出确定、可复现，无需等待真实时间。
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	// ① 登记有效版本 seat-v1：单价 150 分/单位，
+	//    有效期为 2026-03-01 至 2026-03-31（UTC，结束时刻不含）。
+	v1End := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 150,
+		Start:     time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+		End:       &v1End,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("① 登记有效版本 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)，err=<nil>")
+
+	// ② 2026-03-02 10:00（版本有效期内），用一个从未用过的非空标识提交数量 0。
+	//    数量必须是正整数；这次调用的 err 为 nil，但结果是原因 invalid_quantity 的拒绝，
+	//    确认状态为否、单价和总价均为零，请求里的原始数量、费率项、版本原样保留。
+	now = time.Date(2026, 3, 2, 10, 0, 0, 0, time.UTC)
+	wrongReq := tariff.QuoteRequest{
+		RequestID: "quote-wrong-qty",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  0,
+	}
+	rejected, err := book.Quote(wrongReq)
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("② 首次提交数量 0（quote-wrong-qty）", rejected)
+	fmt.Printf("   err=%v：拒绝已被保存，但它是正常受理结果，不是调用错误；零金额也不是免费报价\n", err)
+
+	// 把时钟拨到另一个时刻，证明查询与重试取回的受理时刻不会被重算。
+	now = time.Date(2026, 3, 3, 9, 0, 0, 0, time.UTC)
+
+	// ③ 按原标识查询：非空标识的首次拒绝也已保存，取回的就是②那份记录。
+	got, err := book.Lookup("quote-wrong-qty")
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("③ 按原标识 Lookup（quote-wrong-qty）", got)
+	fmt.Printf("   与首次拒绝完全一致：%v\n", got == rejected)
+
+	// ④ 原样再次提交（相同标识、相同内容）：仍返回首次拒绝，
+	//    原数量 0 与首次受理时刻 2026-03-02 10:00 保持不变。
+	replay, err := book.Quote(wrongReq)
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("④ 原样再次提交（quote-wrong-qty）", replay)
+	fmt.Printf("   与首次拒绝完全一致：%v（数量仍为 %d，受理时刻仍是 %s，没有按 3 月 3 日重新受理）\n",
+		replay == rejected, replay.Request.Quantity, replay.AcceptedAt.Format(time.RFC3339))
+
+	// ⑤ 只把数量改成 4、沿用原标识提交：请求内容与首次不同，
+	//    调用本身返回 ErrRequestIDConflict，没有可使用的新报价结果。
+	_, err = book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-wrong-qty",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	fmt.Printf("⑤ 沿用原标识、只把数量改为 4：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrRequestIDConflict) = %v；这次调用没有可使用的报价结果\n",
+		errors.Is(err, tariff.ErrRequestIDConflict))
+
+	// ⑥ 冲突不会覆盖任何记录：原拒绝仍能查到，原因、原始数量、金额与受理时刻都不变。
+	still, err := book.Lookup("quote-wrong-qty")
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑥ 冲突后再查原标识（quote-wrong-qty）", still)
+	fmt.Printf("   原拒绝未被覆盖：原因=%s 数量=%d 单价=%d 总价=%d 受理时刻=%s\n",
+		still.Reason, still.Request.Quantity, still.UnitPrice, still.Total,
+		still.AcceptedAt.Format(time.RFC3339))
+
+	// ⑦ 改用另一个从未用过的标识、数量 4 引用同一有效版本：
+	//    这是一笔新的首次报价，按 150 分确认总价 600 分，
+	//    来源（费率项、版本）和数量都来自这次新请求，受理时刻是本次时刻。
+	fixed, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-right-qty",
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑦ 换新标识、数量 4 重新报价（quote-right-qty）", fixed)
+	fmt.Printf("   Confirmed=%v；来源 item=%s version=%s 与数量=%d 均属本次新请求，单价 %d 分 × 4 = 总价 %d 分\n",
+		fixed.Confirmed, fixed.Request.ItemID, fixed.Request.VersionID, fixed.Request.Quantity,
+		fixed.UnitPrice, fixed.Total)
+}
+
+func printOutcome(title string, o tariff.Outcome) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   请求 item=%s version=%s 数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	if o.Confirmed {
+		fmt.Printf("   结果=已确认 单价=%d 分 总价=%d 分\n", o.UnitPrice, o.Total)
+	} else {
+		fmt.Printf("   结果=被拒绝 原因=%s 单价=%d 总价=%d（err 为 nil，拒绝不是调用错误）\n",
+			o.Reason, o.UnitPrice, o.Total)
+	}
+}
+```
+
+输出（受理时刻由示例时钟推进到确定值，不依赖运行当天日期或本机时区）：
+
+```text
+① 登记有效版本 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)，err=<nil>
+② 首次提交数量 0（quote-wrong-qty）：
+   请求 item=seat version=seat-v1 数量=0；首次受理时刻=2026-03-02T10:00:00Z
+   结果=被拒绝 原因=invalid_quantity 单价=0 总价=0（err 为 nil，拒绝不是调用错误）
+   err=<nil>：拒绝已被保存，但它是正常受理结果，不是调用错误；零金额也不是免费报价
+③ 按原标识 Lookup（quote-wrong-qty）：
+   请求 item=seat version=seat-v1 数量=0；首次受理时刻=2026-03-02T10:00:00Z
+   结果=被拒绝 原因=invalid_quantity 单价=0 总价=0（err 为 nil，拒绝不是调用错误）
+   与首次拒绝完全一致：true
+④ 原样再次提交（quote-wrong-qty）：
+   请求 item=seat version=seat-v1 数量=0；首次受理时刻=2026-03-02T10:00:00Z
+   结果=被拒绝 原因=invalid_quantity 单价=0 总价=0（err 为 nil，拒绝不是调用错误）
+   与首次拒绝完全一致：true（数量仍为 0，受理时刻仍是 2026-03-02T10:00:00Z，没有按 3 月 3 日重新受理）
+⑤ 沿用原标识、只把数量改为 4：err=tariff: request id already used with different content
+   errors.Is(err, tariff.ErrRequestIDConflict) = true；这次调用没有可使用的报价结果
+⑥ 冲突后再查原标识（quote-wrong-qty）：
+   请求 item=seat version=seat-v1 数量=0；首次受理时刻=2026-03-02T10:00:00Z
+   结果=被拒绝 原因=invalid_quantity 单价=0 总价=0（err 为 nil，拒绝不是调用错误）
+   原拒绝未被覆盖：原因=invalid_quantity 数量=0 单价=0 总价=0 受理时刻=2026-03-02T10:00:00Z
+⑦ 换新标识、数量 4 重新报价（quote-right-qty）：
+   请求 item=seat version=seat-v1 数量=4；首次受理时刻=2026-03-03T09:00:00Z
+   结果=已确认 单价=150 分 总价=600 分
+   Confirmed=true；来源 item=seat version=seat-v1 与数量=4 均属本次新请求，单价 150 分 × 4 = 总价 600 分
+```
+
+对照输出即可分清“拒绝被保存”和“调用返回错误”，并理解改正数量不会覆盖已受理的记录：
+
+- **②** `err` 为 `<nil>`、`Confirmed=false`、原因 `invalid_quantity`：这是**被保存的拒绝**，不是调用错误。数量原样保留为 0，单价、总价都是零——零金额表示“没有可给出的金额”，不是按 150 分免费报价。
+- **③④** 即使受理时钟已拨到 3 月 3 日，`Lookup` 和原样重试取回的仍是 ② 那份首次拒绝：数量 0、首次受理时刻 3 月 2 日 10:00，完全一致。原样重试不是重新受理，只是取回历史结果。
+- **⑤** 是**调用本身返回错误**（`ErrRequestIDConflict`）：相同标识改动了数量，账本不受理新内容，也没有任何报价结果可用——与 ② 的“报价被拒绝”是两类不同的“没成功”。
+- **⑥** 证明冲突不留改动：原拒绝记录仍能查到，原因、原始数量 0、零金额和首次受理时刻全部不变。改正数量不会覆盖已经受理的记录。
+- **⑦** 只有换用从未用过的新标识才发起新的首次报价：这次来源（`seat` / `seat-v1`）与数量 4 都属于新请求，版本有效，才确认单价 150 分、总价 600 分，受理时刻是本次的 3 月 3 日 09:00。新标识并不豁免任何规则——这笔新报价仍受版本有效期与金额规则约束，版本不可用或总价溢出时照样会被拒绝。
+
 ## 登记替代版本：旧版能被截短，不代表新版能占用其他版本的时间
 
 上文讲的是费率变化后如何核对报价；准备**登记替代版本**时还需要知道重叠是怎么判定的：
