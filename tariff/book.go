@@ -28,6 +28,7 @@ var (
 	ErrNoEffectiveVersion = errors.New("tariff: no effective version for the rate item at the given time")
 	ErrRequestNotFound    = errors.New("tariff: request id not found")
 	ErrRequestIDConflict  = errors.New("tariff: request id already used with different content")
+	ErrEmptyItemIDQuery   = errors.New("tariff: item id must not be empty")
 )
 
 // RejectReason 区分报价被拒绝的原因。
@@ -417,4 +418,49 @@ func (b *Book) Lookup(requestID string) (Outcome, error) {
 		return Outcome{}, ErrRequestNotFound
 	}
 	return out, nil
+}
+
+// ItemOutcomes 返回当前账本中请求来源属于指定费率项的全部首次受理结果。
+//
+// 结果以已保存的首次请求来源（Outcome.Request.ItemID）为准，与该费率项是否
+// 登记过版本无关：即使费率项从未登记过版本，合法数量的请求因 version_not_found
+// 被拒绝的记录同样会被列出。其他费率项即使使用了同名版本也不会混入。
+//
+// 确认与拒绝都在结果中：不会因为引用的版本现在已经失效而筛掉记录，也不会按
+// 当前单价重新计算已保存的金额；每条记录保留首次请求中的请求标识、费率项、
+// 版本、数量，以及首次受理时刻、确认状态、单价、总价和拒绝原因。
+// 相同请求标识的原样重试只返回首次结果，内容冲突不产生新记录，两者都不会
+// 增加列表内容；空请求标识产生的拒绝不保存，因此不会出现在列表中。
+//
+// 列表按首次受理时刻从早到晚排列，时刻相同时按请求标识的字符串顺序排列。
+// 非空费率项标识没有任何匹配记录时返回空列表且不报错；空费率项标识返回
+// ErrEmptyItemIDQuery，调用方可用 errors.Is 明确识别这类输入错误。
+//
+// 该查询只读取账本已有的受理结果：不受理报价、不占用请求标识，
+// Quote、Lookup、ItemVersions、EffectiveVersionAt 的既有规则都不受影响。
+// 返回的列表及其中的每条记录都是独立副本，调用方修改后再做单笔查询、
+// 原样重试或再次列表查询，仍得到账本保存的原始结果。
+func (b *Book) ItemOutcomes(itemID string) ([]Outcome, error) {
+	if itemID == "" {
+		return nil, ErrEmptyItemIDQuery
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	outcomes := make([]Outcome, 0)
+	for _, out := range b.requests {
+		if out.Request.ItemID == itemID {
+			// Outcome 只含值类型字段（QuoteRequest 与 time.Time 均为值类型），
+			// 直接复制即可得到与账本数据互不影响的独立记录。
+			outcomes = append(outcomes, out)
+		}
+	}
+	sort.Slice(outcomes, func(i, j int) bool {
+		if !outcomes[i].AcceptedAt.Equal(outcomes[j].AcceptedAt) {
+			return outcomes[i].AcceptedAt.Before(outcomes[j].AcceptedAt)
+		}
+		return outcomes[i].Request.RequestID < outcomes[j].Request.RequestID
+	})
+	return outcomes, nil
 }
