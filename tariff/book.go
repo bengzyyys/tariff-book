@@ -418,3 +418,46 @@ func (b *Book) Lookup(requestID string) (Outcome, error) {
 	}
 	return out, nil
 }
+
+// ItemQuotes 返回当前账本中请求来源属于指定费率项的全部首次受理结果，
+// 确认与拒绝都包含在内。
+//
+// 匹配以保存的请求来源（Outcome.Request.ItemID）为准，与费率版本登记无关：
+// 费率项从未登记过版本、但已有请求因 version_not_found 被拒绝并保存时，
+// 这份拒绝同样列入结果，不会因为没有费率版本而报错。非空费率项标识没有
+// 任何匹配记录时返回空列表和 nil 错误；空费率项标识返回 ErrEmptyItemID。
+//
+// 列表按首次受理时刻从早到晚排列，时刻相同时按请求标识的字符串顺序排列。
+// 同一份首次结果只出现一次；其他费率项即使用了同名版本也不会混入。
+// 记录一律以保存的首次结果为准：不按版本当前是否有效筛选，也不拿当前
+// 单价重算金额——已确认记录保留确认时的单价和总价，被拒绝记录保留拒绝
+// 原因，其中的零单价、零总价只表示“没有可给出的金额”，不是免费确认价。
+//
+// 该查询只读取账本已保存的结果，不受理报价、不占用请求标识。
+// 返回的列表和记录都是独立副本，调用方改动后，后续 Lookup、原样重试
+// 和再次 ItemQuotes 仍返回账本中保存的原始结果。
+func (b *Book) ItemQuotes(itemID string) ([]Outcome, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if itemID == "" {
+		return nil, ErrEmptyItemID
+	}
+	// 空请求标识的拒绝从未保存，自然不在 b.requests 中，无需额外排除。
+	outs := make([]Outcome, 0)
+	for _, out := range b.requests {
+		if out.Request.ItemID != itemID {
+			continue
+		}
+		// Outcome 与其中的 QuoteRequest、time.Time 都是值类型，
+		// 逐条复制即得到与账本存储互不影响的独立记录。
+		outs = append(outs, out)
+	}
+	sort.Slice(outs, func(i, j int) bool {
+		if !outs[i].AcceptedAt.Equal(outs[j].AcceptedAt) {
+			return outs[i].AcceptedAt.Before(outs[j].AcceptedAt)
+		}
+		return outs[i].Request.RequestID < outs[j].Request.RequestID
+	})
+	return outs, nil
+}
