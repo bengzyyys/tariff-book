@@ -545,6 +545,216 @@ func printOutcome(title string, o tariff.Outcome) {
 - **③④⑤** 三笔拒绝的调用错误都是 `nil`，单价和总价都是零：零金额只是“没有可给出的金额”，不代表登记的费率是零（两版单价实际都是 MaxInt64）；也不能仅凭 `err == nil` 当作确认报价，必须检查 `Confirmed`。
 - **⑥** 数量 1 时总价恰好等于有符号 64 位整数最大值，仍可确认——上限本身不是非法金额，只有超过上限才被拒绝。
 
+## 单价为零时怎样判断报价是否成立
+
+`RegisterRequest.UnitPrice` 允许登记为 **0 分**（只有负数单价才以 `ErrInvalidUnitPrice` 拒绝）。因此一笔报价的单价和总价**同时为零**有两种完全不同的含义，不能只凭金额大小判断，也不能只凭调用没有返回错误判断：
+
+- **已确认的零价报价**：版本在受理时刻有效、数量为合法正整数，账本确认这笔报价，`Confirmed == true`、`Reason` 为空、`UnitPrice == 0`、`Total == 0`——零是真实的成交金额。
+- **没有可用金额的拒绝**：报价已被正常受理但未通过检查，`Confirmed == false`、`Reason` 给出原因（如 `invalid_quantity`、`version_expired`），此时单价和总价一律为零——零金额只表示“没有可给出的金额”，与登记的费率是不是零无关。
+
+两种情况下调用的 `error` 都可能为 `nil`（拒绝是正常受理结果，不是调用错误），所以**区分依据只能是 `Confirmed` 和 `Reason`**：`Confirmed == true` 且 `Reason == ""` 才是零价成交。此外还要记住三条既有规则在零单价下同样成立：
+
+- 零单价**不放宽数量要求**：`Quantity` 仍必须是正整数，数量为零或负数都得到 `invalid_quantity`，拒绝结果原样保留提交的原始数量（零就是零、负数不会被改成零）。
+- 零单价**不会产生总价溢出**：`0 × 数量` 恒为零，即使数量取有符号 64 位整数最大值，总价也是零且报价成立；零总价也不表示“数量没有被记录”——确认结果的 `Request.Quantity` 仍原样保留这个最大数量。
+- 零单价**不改变版本有效期**：开始时刻含在有效期内、结束时刻不含；在结束时刻提交的新报价即使单价为零也得到 `version_expired`，零价不会让已到期版本继续接受报价。
+
+### 围绕同一个零单价版本的完整示例
+
+程序位于 [`examples/zeroprice/main.go`](examples/zeroprice/main.go)，可直接运行：
+
+```bash
+go run ./examples/zeroprice
+```
+
+所有日期与时刻均为 2026 年 UTC、结束时刻不含；账本初始化、费率登记和受理时刻全部在代码中给出，并通过公开选项 `tariff.WithClock` 注入可手动推进的时钟，因此无论在哪一天运行、处于什么本机时区，输出都确定、可复现，读者无需补写初始化代码，也不必等待真实时间流逝。生产环境直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一个费率项 `seat` 上只登记一个零单价版本 `seat-free`，有效期为半开区间 `[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)`）：
+
+1. 在版本**开始生效的时刻**（3 月 1 日 00:00，开始时刻含在有效期内），用一个从未使用过的非空标识 `zero-price-at-start` 提交合法正数量——数量取有符号 64 位整数最大值，得到已确认结果：单价、总价均为零、拒绝原因为空，结果中的费率项、版本、数量和受理时刻与本次请求一致；
+2. 在有效期内（3 月 15 日 12:00）换用另一个新标识 `zero-price-zero-qty` 提交数量 0：未确认、原因 `invalid_quantity`、单价和总价仍为零，原始数量 0 原样保留；
+3. 再换用新标识 `zero-price-neg-qty` 提交数量 -1：负数量同样不合法，仍是 `invalid_quantity`，拒绝结果保留提交的原始数量 -1；
+4. 在版本**结束时刻**（3 月 31 日 00:00，不含在有效期内）再用一个新标识 `zero-price-at-end` 提交合法正数量 4：得到 `version_expired` 拒绝——零单价不会让已到期版本继续接受新报价。
+
+每笔报价使用各自从未使用过的非空请求标识，仍遵守首次受理规则；②④两次拒绝的调用错误都为空，它们与第 1 笔零价确认的区别在输出中直接可见。
+
+```go
+// 命令 zeroprice 是“单价为零时怎样判断报价是否成立”的完整可运行示例：
+// 登记一个零单价版本后，在生效起点以有符号 64 位整数最大数量报价，
+// 得到单价、总价均为零的已确认结果；同一版本有效期内提交数量零与负数，
+// 零单价不放宽数量必须为正整数的要求，得到 invalid_quantity 拒绝；
+// 在版本结束时刻（不含）再提交合法正数量，得到 version_expired 拒绝。
+// 这些结果的金额都是零、调用错误都为空，区分依据是 Confirmed 与 Reason，
+// 而不是金额大小或 err 是否为空。
+//
+// 运行：
+//
+//	go run ./examples/zeroprice
+package main
+
+import (
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述时刻均为 2026 年 UTC，版本有效期为半开区间 [freeStart, freeEnd)：
+// 开始时刻包含在内，结束时刻不包含。
+var (
+	freeStart = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	freeEnd   = time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+)
+
+func main() {
+	// 演示时钟：受理时刻取自变量 now，推进它即可让同一本账本走到不同时期。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now；
+	// 这里传入 tariff.WithClock 只是为了让示例输出确定、可复现，无需等待真实时间。
+	now := freeStart
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return now }))
+
+	// ① 登记零单价版本 seat-free：单价 0 分是合法登记（只有负数单价非法），
+	//    有效期 [2026-03-01, 2026-03-31)（UTC，结束时刻不含）。
+	registeredEnd := freeEnd
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-free",
+		UnitPrice: 0,
+		Start:     freeStart,
+		End:       &registeredEnd,
+	}); err != nil {
+		panic(err)
+	}
+	printViews(book, "① 登记零单价版本 seat-free（单价=0 分）后的版本视图")
+
+	// 以下每笔报价都使用各自从未使用过的非空请求标识，输出反映的都是首次受理的判断。
+
+	// ② 生效起点 2026-03-01 00:00（开始时刻含在有效期内），用第一个新标识
+	//    提交合法正数量——取有符号 64 位整数最大值。零单价下 0×任何数量都是 0，
+	//    不会因为数量很大而总价溢出；也不能把零总价理解成“数量没有被记录”。
+	now = freeStart
+	confirmed, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "zero-price-at-start",
+		ItemID:    "seat",
+		VersionID: "seat-free",
+		Quantity:  math.MaxInt64,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("② 生效起点以最大正数量报价（zero-price-at-start）", confirmed, err)
+	fmt.Printf("   Confirmed=%v 且拒绝原因为%q：这是已确认的零价报价；结果中的费率项、版本、数量=%d、受理时刻=%s 都与本次请求一致\n",
+		confirmed.Confirmed, confirmed.Reason, confirmed.Request.Quantity,
+		confirmed.AcceptedAt.Format(time.RFC3339))
+
+	// ③ 有效期内（2026-03-15 12:00）换一个新标识提交数量 0。
+	//    零单价不放宽“数量必须是正整数”的要求：err 为 nil，但结果未确认、
+	//    原因 invalid_quantity，单价和总价仍为零，原始数量 0 原样保留。
+	now = time.Date(2026, 3, 15, 12, 0, 0, 0, time.UTC)
+	zeroQty, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "zero-price-zero-qty",
+		ItemID:    "seat",
+		VersionID: "seat-free",
+		Quantity:  0,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("③ 有效期内提交数量 0（zero-price-zero-qty）", zeroQty, err)
+
+	// ④ 负数量同样不合法：再换一个新标识提交数量 -1，仍是 invalid_quantity，
+	//    拒绝结果保留提交的原始数量 -1，不会被改成零。
+	negQty, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "zero-price-neg-qty",
+		ItemID:    "seat",
+		VersionID: "seat-free",
+		Quantity:  -1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("④ 有效期内提交数量 -1（zero-price-neg-qty）", negQty, err)
+
+	// ⑤ 结束时刻 2026-03-31 00:00（不含在有效期内），再用一个新标识提交合法正数量。
+	//    零单价不会让已到期版本继续接受新报价：err 为 nil，但得到 version_expired 拒绝，
+	//    单价和总价为零。
+	now = freeEnd
+	expired, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "zero-price-at-end",
+		ItemID:    "seat",
+		VersionID: "seat-free",
+		Quantity:  4,
+	})
+	if err != nil {
+		panic(err)
+	}
+	printOutcome("⑤ 结束时刻以合法正数量报价（zero-price-at-end）", expired, err)
+}
+
+func printViews(book *tariff.Book, title string) {
+	fmt.Printf("%s：\n", title)
+	views, err := book.ItemVersions("seat")
+	if err != nil {
+		panic(err)
+	}
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 开始=%s 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice, v.Start.Format(time.RFC3339),
+			fmtEnd(v.End), fmtEnd(v.EffectiveEnd), v.Replaces, v.SupersededBy)
+	}
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+
+// printOutcome 把一笔受理结果的五个判断要素一次展示清楚：
+// 调用错误、确认状态、拒绝原因、金额（单价/总价）、请求来源与首次受理时刻。
+func printOutcome(title string, o tariff.Outcome, err error) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   调用错误 err=%v\n", err)
+	fmt.Printf("   请求来源 item=%s version=%s 数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	fmt.Printf("   确认状态=%v 拒绝原因=%q 单价=%d 分 总价=%d 分\n",
+		o.Confirmed, o.Reason, o.UnitPrice, o.Total)
+}
+```
+
+输出（受理时刻由示例时钟固定在确定值，不依赖运行当天日期或本机时区）：
+
+```text
+① 登记零单价版本 seat-free（单价=0 分）后的版本视图：
+   seat-free：单价=0 开始=2026-03-01T00:00:00Z 登记结束=2026-03-31T00:00:00Z 实际有效结束=2026-03-31T00:00:00Z 替代="" 被替代=""
+② 生效起点以最大正数量报价（zero-price-at-start）：
+   调用错误 err=<nil>
+   请求来源 item=seat version=seat-free 数量=9223372036854775807；首次受理时刻=2026-03-01T00:00:00Z
+   确认状态=true 拒绝原因="" 单价=0 分 总价=0 分
+   Confirmed=true 且拒绝原因为""：这是已确认的零价报价；结果中的费率项、版本、数量=9223372036854775807、受理时刻=2026-03-01T00:00:00Z 都与本次请求一致
+③ 有效期内提交数量 0（zero-price-zero-qty）：
+   调用错误 err=<nil>
+   请求来源 item=seat version=seat-free 数量=0；首次受理时刻=2026-03-15T12:00:00Z
+   确认状态=false 拒绝原因="invalid_quantity" 单价=0 分 总价=0 分
+④ 有效期内提交数量 -1（zero-price-neg-qty）：
+   调用错误 err=<nil>
+   请求来源 item=seat version=seat-free 数量=-1；首次受理时刻=2026-03-15T12:00:00Z
+   确认状态=false 拒绝原因="invalid_quantity" 单价=0 分 总价=0 分
+⑤ 结束时刻以合法正数量报价（zero-price-at-end）：
+   调用错误 err=<nil>
+   请求来源 item=seat version=seat-free 数量=4；首次受理时刻=2026-03-31T00:00:00Z
+   确认状态=false 拒绝原因="version_expired" 单价=0 分 总价=0 分
+```
+
+对照输出即可在“金额全为零、调用错误全为空”的情况下分清确认与拒绝：
+
+- **②** `Confirmed=true`、拒绝原因为 `""`、单价 0、总价 0：这是**已确认的零价报价**，零是成交金额，不是“没有可给出的金额”。数量原样记录为 9223372036854775807——`0 × MaxInt64` 也是 0，零单价不会因为数量很大而总价溢出，零总价也不能理解成数量没有被记录。
+- **③④** `Confirmed=false`、原因 `invalid_quantity`：零单价不放宽“数量必须为正整数”，数量 0 和 -1 都被拒；两次调用的 `err` 都是 `<nil>`，单价、总价也都是零，但拒绝结果分别保留提交的原始数量 0 和 -1（负数不会被改成零）。它们与 ② 的金额完全相同，区别只在确认状态与拒绝原因。
+- **⑤** `Confirmed=false`、原因 `version_expired`：受理时刻恰为结束时刻 2026-03-31T00:00:00Z，结束时刻不含在有效期内，零单价不会让已到期版本继续接受新报价。
+- **②③④⑤** 四次调用的 `err` 均为 `<nil>`：报价是否成立只能看 `Confirmed`（拒绝时再看 `Reason`），既不能用“调用没报错”判断成功，也不能用“金额是不是零”判断。各笔报价使用各自从未使用过的非空标识，仍是首次受理规则下的全新请求——这里演示的全部是账本既有行为，零单价没有任何特殊通道，公开入口、报价规则与其他示例完全一致。
+
 ## 数量填错后怎样重新报价
 
 `Quantity` 必须是**正整数**。使用一个从未用过的非空请求标识首次提交时，若数量为零或负数：
