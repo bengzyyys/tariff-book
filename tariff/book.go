@@ -29,6 +29,7 @@ var (
 	ErrRequestNotFound    = errors.New("tariff: request id not found")
 	ErrRequestIDConflict  = errors.New("tariff: request id already used with different content")
 	ErrEmptyItemIDQuery   = errors.New("tariff: item id must not be empty")
+	ErrInvalidRange       = errors.New("tariff: range end must be after range start")
 )
 
 // RejectReason 区分报价被拒绝的原因。
@@ -350,6 +351,62 @@ func (b *Book) EffectiveVersionAt(itemID string, at time.Time) (VersionView, err
 		return VersionView{}, ErrNoEffectiveVersion
 	}
 	return versionView(found), nil
+}
+
+// VersionsInRange 返回指定费率项在半开范围 [from, to) 内实际生效过的版本列表，
+// 一次只查询一个费率项，调用方不必事先知道版本标识。
+//
+// 范围的开始时刻包含在内、结束时刻不包含；只有版本的实际有效区间
+// [EffectiveStart, EffectiveEnd) 与该范围存在交集时才列出，仅在边界处相接
+// （版本结束即范围开始，或版本开始即范围结束）不算命中。实际结束为 nil 的
+// 持续有效版本按没有结束边界处理。
+//
+// 判断依据是查询时账本已经登记的实际有效区间：被替代的旧版按截短后的实际
+// 结束参与判断，不会因为它登记的结束仍在范围内而被列入；替代它的新版到期后
+// 旧版也不会恢复。范围内的空档不补入相邻版本。范围可以在过去或未来，
+// 与账本时钟（WithClock）无关。时间按实际时刻比较，同一瞬间用不同时区
+// 表示结论一致；其他费率项中同名的版本不参与。
+//
+// 返回的列表沿用 ItemVersions 的版本视图：版本标识、整数分单价、登记起止、
+// 实际有效区间和替代关系（Replaces / SupersededBy）都保留账本中的原值，
+// 不会把版本边界改成查询范围的边界。每个命中的版本只出现一次，按实际生效
+// 起点从早到晚排列，起点相同时按版本标识的字符串顺序排列。
+//
+// 结束时刻不晚于开始时刻时返回 ErrInvalidRange（可用 errors.Is 判别），
+// 不返回版本列表；范围合法但费率项从未登记过版本时返回 ErrItemNotFound；
+// 费率项存在但范围内没有命中版本时返回空列表且不报错。
+//
+// 该查询只读取版本信息，不受理报价、不占用请求标识，也不影响已保存的
+// 受理结果。返回的视图是独立副本，调用方修改其中的结束时间不会改变账本，
+// 也不会影响后续查询与报价。
+func (b *Book) VersionsInRange(itemID string, from, to time.Time) ([]VersionView, error) {
+	if !to.After(from) {
+		return nil, ErrInvalidRange
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	versions, ok := b.items[itemID]
+	if !ok || len(versions) == 0 {
+		return nil, ErrItemNotFound
+	}
+	views := make([]VersionView, 0, len(versions))
+	for _, v := range versions {
+		// 实际有效区间 [v.start, v.effEnd) 与查询范围 [from, to) 有交集才命中；
+		// 仅在边界处相接不算交集，effEnd 为 nil 按没有结束边界处理。
+		if !intervalsOverlap(from, &to, v.start, v.effEnd) {
+			continue
+		}
+		views = append(views, versionView(v))
+	}
+	sort.Slice(views, func(i, j int) bool {
+		if !views[i].EffectiveStart.Equal(views[j].EffectiveStart) {
+			return views[i].EffectiveStart.Before(views[j].EffectiveStart)
+		}
+		return views[i].VersionID < views[j].VersionID
+	})
+	return views, nil
 }
 
 // Quote 按首次受理时刻判断指定版本是否有效并给出报价。
