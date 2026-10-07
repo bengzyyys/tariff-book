@@ -6,7 +6,7 @@
 - 登记一个**替代旧版本**的新版本，账本自动把旧版本的实际有效期截断到交接时刻；
 - 按费率项和**指定时刻**查询当时生效的单个版本（`EffectiveVersionAt`），选择依据是账本已登记的实际有效区间；
 - 按费率项和**时间范围**列出这段期间生效过的版本（`VersionsInRange`），一次一个费率项，不必事先知道版本标识；
-- 在指定时刻对指定版本报价，得到**首次受理结果**（确认并给出单价、总价，或带原因拒绝）；
+- 对指定版本发起报价，账本按**首次受理时刻**（账本时钟，默认真实时间）判断该版本在受理时是否可用，得到**首次受理结果**（确认并给出单价、总价，或带原因拒绝）——报价请求本身没有指定受理时刻的参数；
 - 按请求标识进行幂等重试和事后查询——费率变化后可据此核对一笔报价应沿用原请求标识还是发起新报价；
 - 不必先知道请求标识，直接按**费率项**列出该项的全部首次受理结果（`ItemOutcomes`），确认与拒绝都在其中。
 
@@ -318,6 +318,229 @@ view, err := book.EffectiveVersionAt("seat", t)
 ### 只读、独立
 
 该查询只读取版本信息：**不受理报价、不占用请求标识**，`Quote`、`ItemVersions`、`Lookup` 的既有规则和已保存的确认价、拒绝原因都不受影响。返回的视图是独立副本，调用方修改其中的结束时间不会改变账本，也不会影响后续查询与报价。
+
+## 查到过去生效的版本后，现在怎样报价
+
+`EffectiveVersionAt` 与 `Quote` 使用两个不同的时间，不能混用：
+
+- **查询时刻**：`EffectiveVersionAt(itemID, at)` 使用**调用方传入的 `at`**，回答账本已登记的版本在那一刻谁生效。`at` 可以是过去也可以是未来，与账本时钟无关。
+- **首次受理时刻**：`Quote` 对每一笔**新请求**使用**账本时钟给出的受理时刻**（默认 `time.Now`，可用 `WithClock` 定制）判断指定版本是否可用。`QuoteRequest` 只有请求标识、费率项、版本和数量，**没有指定历史受理时间的参数**。
+
+因此，一次历史查询成功——例如查到 7 月 8 日生效的是旧版——**不会把账本时钟拨回过去，也不会替随后提交的请求保留旧费率**。查到过去生效的旧版后，无法“按那个时刻的价格”重新报价：随后用新标识提交报价时，账本只看受理这一刻旧版是否仍在实际有效期内。若旧版已被替代（实际有效结束早于受理时刻），即使它登记的结束日期尚未到，新请求也会得到 `version_expired` 拒绝，账本**不会自动改用新版**确认这份请求。要按当前费率报价，应当查询**受理时刻**生效的版本，再用另一个从未使用过的请求标识引用该版本提交。
+
+拒绝是正常受理结果：调用错误为 `nil`、`Confirmed == false`，拒绝结果中单价和总价均为零——零金额只是“没有可给出的金额”，**不能解释为免费确认价**；确认结果的拒绝原因（`Reason`）为空。
+
+### 同一受理时刻两次报价的完整示例
+
+程序位于 [`examples/pastquote/main.go`](examples/pastquote/main.go)，可直接运行：
+
+```bash
+go run ./examples/pastquote
+```
+
+所有日期均为 2026 年 UTC、结束时刻不含；账本初始化、费率登记和受理时刻全部在代码中给出，并通过公开选项 `tariff.WithClock` 把演示时钟固定在受理时刻 2026-07-18 09:00，因此无论在哪一天运行，输出都确定、可复现，读者无需等待真实时间流逝。默认账本使用真实时间（生产环境直接 `tariff.NewBook()`），示例中的演示时钟只用于使结果确定。
+
+时间线（同一费率项 `seat`）：
+
+1. 旧版 `seat-v1`：单价 240 分，2026-07-01 00:00 生效，登记结束为 2026-07-31 00:00（不含）；
+2. 新版 `seat-v2`：单价 300 分，2026-07-12 00:00 起替代旧版并持续有效——旧版的登记结束仍是 7 月 31 日，实际有效结束被截短到 7 月 12 日；
+3. 把报价受理时刻固定在 2026-07-18 09:00：查询 7 月 8 日应得到旧版；随后用一个未使用过的请求标识引用查到的旧版、数量 5，应被拒绝，原因是 `version_expired`；
+4. 同一受理时刻按该时刻查询应得到新版，再用另一个未使用过的标识引用新版、数量 5，应确认单价 300 分、总价 1500 分。
+
+```go
+// 命令 pastquote 是“查到过去生效的版本后，现在怎样报价”的完整可运行示例：
+// 同一费率项的旧版（单价 240 分，2026-07-01 生效、登记结束 2026-07-31）
+// 被新版（单价 300 分，2026-07-12 起替代旧版并持续有效）截短实际有效期。
+// 把报价受理时刻固定在 2026-07-18 09:00：查询 7 月 8 日得到旧版，
+// 随后用一个未使用过的请求标识引用旧版、数量 5，得到 version_expired 拒绝；
+// 同一受理时刻按该时刻查询得到新版，再用另一个未使用过的标识引用新版、
+// 数量 5，确认单价 300 分、总价 1500 分。两次报价的受理时刻完全相同，
+// 区别只在引用的版本于受理时刻是否仍在实际有效期内。
+//
+// 运行：
+//
+//	go run ./examples/pastquote
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指 2026 年 UTC，结束时刻不含。
+var (
+	v1Start   = time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)  // 旧版生效起点（含）
+	v1RegEnd  = time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC) // 旧版登记结束（不含）
+	v2Start   = time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC) // 新版替代旧版的交接点，即旧版实际有效结束（不含）
+	acceptAt  = time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC) // 报价首次受理时刻（演示时钟固定在此）
+	pastQuery = time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)  // 历史查询时刻：当时旧版仍生效
+)
+
+func main() {
+	// 演示时钟：把受理时刻固定在 2026-07-18 09:00，全程不推进。
+	// 生产环境直接 tariff.NewBook() 即使用真实的 time.Now；
+	// 这里传入 tariff.WithClock 只是为了让示例输出确定、可复现，
+	// 无论在哪一天运行都不必等待真实时间。
+	book := tariff.NewBook(tariff.WithClock(func() time.Time { return acceptAt }))
+
+	// ① 登记旧版 seat-v1：单价 240 分，2026-07-01 生效，登记结束 2026-07-31（不含）。
+	oldEnd := v1RegEnd
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 240,
+		Start:     v1Start,
+		End:       &oldEnd,
+	}); err != nil {
+		panic(err)
+	}
+
+	// ② 登记新版 seat-v2：单价 300 分，2026-07-12 00:00 起替代旧版并持续有效。
+	//    旧版的登记结束仍是 7 月 31 日，实际有效结束从这一刻起被截短到 7 月 12 日。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 300,
+		Start:     v2Start,
+		Replaces:  "seat-v1",
+	}); err != nil {
+		panic(err)
+	}
+	printViews(book, "①② 两版登记完成后的版本视图")
+
+	// ③ 历史查询：2026-07-08 00:00 生效的是旧版。
+	//    EffectiveVersionAt 使用调用方传入的查询时刻，回答账本已登记的版本
+	//    在那一刻谁生效；这次查询成功不会把账本时钟拨回 7 月 8 日，
+	//    也不会替随后提交的请求保留旧费率。
+	old, err := book.EffectiveVersionAt("seat", pastQuery)
+	if err != nil {
+		panic(err)
+	}
+	printQuery("③ 按过去时刻查询", pastQuery, old)
+	fmt.Println("   查询成功只说明旧版在 7 月 8 日生效；账本时钟仍在 2026-07-18 09:00，没有被拨回过去")
+	fmt.Println()
+
+	// ④ 用一个从未使用过的请求标识引用查到的旧版，数量 5。
+	//    报价请求本身没有指定历史受理时间的参数：Quote 对这笔新请求只认
+	//    账本时钟给出的首次受理时刻 2026-07-18 09:00。旧版的实际有效期
+	//    已止于 7 月 12 日——虽然它登记的结束 7 月 31 日尚未到，
+	//    仍得到 version_expired 拒绝；账本也不会自动改用新版确认这份请求。
+	rejected, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-old-after-past-query",
+		ItemID:    "seat",
+		VersionID: old.VersionID,
+		Quantity:  5,
+	})
+	printOutcome("④ 受理时刻引用查到的旧版（quote-old-after-past-query）", rejected, err)
+	fmt.Println("   旧版登记结束 2026-07-31 尚未到，但实际有效结束 2026-07-12 已过；")
+	fmt.Println("   结果的请求来源仍是旧版 seat-v1，账本没有自动改用新版确认")
+	fmt.Println()
+
+	// ⑤ 同一受理时刻，按该时刻查询：2026-07-18 09:00 生效的是新版。
+	current, err := book.EffectiveVersionAt("seat", acceptAt)
+	if err != nil {
+		panic(err)
+	}
+	printQuery("⑤ 按受理时刻查询", acceptAt, current)
+	fmt.Println()
+
+	// ⑥ 换另一个从未使用过的标识引用新版，数量 5：
+	//    新版在受理时刻有效，确认单价 300 分、总价 1500 分。
+	confirmed, err := book.Quote(tariff.QuoteRequest{
+		RequestID: "quote-new-at-acceptance",
+		ItemID:    "seat",
+		VersionID: current.VersionID,
+		Quantity:  5,
+	})
+	printOutcome("⑥ 受理时刻引用新版（quote-new-at-acceptance）", confirmed, err)
+}
+
+// printViews 打印登记完成后账本保存的完整版本视图，
+// 登记区间与实际有效区间并排显示，便于看出两者不是同一个边界。
+func printViews(book *tariff.Book, title string) {
+	fmt.Printf("%s：\n", title)
+	views, err := book.ItemVersions("seat")
+	if err != nil {
+		panic(err)
+	}
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 分 登记区间=[%s, %s) 实际有效区间=[%s, %s) 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice,
+			v.Start.Format(time.RFC3339), fmtEnd(v.End),
+			v.EffectiveStart.Format(time.RFC3339), fmtEnd(v.EffectiveEnd),
+			v.Replaces, v.SupersededBy)
+	}
+	fmt.Println()
+}
+
+// printQuery 打印一次按时刻查询：查询时刻由调用方给出，
+// 返回的是该时刻生效版本的视图（含实际有效结束）。
+func printQuery(title string, at time.Time, v tariff.VersionView) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   查询时刻=%s → 生效版本=%s 单价=%d 分 实际有效结束=%s\n",
+		at.Format(time.RFC3339), v.VersionID, v.UnitPrice, fmtEnd(v.EffectiveEnd))
+}
+
+// printOutcome 打印一笔报价的首次受理结果：请求来源、首次受理时刻、
+// 调用错误与确认/拒绝结论。拒绝的调用错误为 nil，单价总价为零；
+// 确认结果的拒绝原因为空。
+func printOutcome(title string, o tariff.Outcome, err error) {
+	fmt.Printf("%s：\n", title)
+	fmt.Printf("   请求 item=%s version=%s 数量=%d；首次受理时刻=%s\n",
+		o.Request.ItemID, o.Request.VersionID, o.Request.Quantity,
+		o.AcceptedAt.Format(time.RFC3339))
+	fmt.Printf("   调用错误 err=%v\n", err)
+	if o.Confirmed {
+		fmt.Printf("   结果=已确认 Confirmed=true 原因=%q 单价=%d 分 总价=%d 分\n",
+			string(o.Reason), o.UnitPrice, o.Total)
+	} else {
+		fmt.Printf("   结果=被拒绝 Confirmed=false 原因=%s 单价=%d 总价=%d（零金额不是免费确认价）\n",
+			o.Reason, o.UnitPrice, o.Total)
+	}
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+```
+
+输出（受理时刻由示例时钟固定在确定值，不依赖运行当天）：
+
+```text
+①② 两版登记完成后的版本视图：
+   seat-v1：单价=240 分 登记区间=[2026-07-01T00:00:00Z, 2026-07-31T00:00:00Z) 实际有效区间=[2026-07-01T00:00:00Z, 2026-07-12T00:00:00Z) 替代="" 被替代="seat-v2"
+   seat-v2：单价=300 分 登记区间=[2026-07-12T00:00:00Z, 无（持续有效）) 实际有效区间=[2026-07-12T00:00:00Z, 无（持续有效）) 替代="seat-v1" 被替代=""
+
+③ 按过去时刻查询：
+   查询时刻=2026-07-08T00:00:00Z → 生效版本=seat-v1 单价=240 分 实际有效结束=2026-07-12T00:00:00Z
+   查询成功只说明旧版在 7 月 8 日生效；账本时钟仍在 2026-07-18 09:00，没有被拨回过去
+
+④ 受理时刻引用查到的旧版（quote-old-after-past-query）：
+   请求 item=seat version=seat-v1 数量=5；首次受理时刻=2026-07-18T09:00:00Z
+   调用错误 err=<nil>
+   结果=被拒绝 Confirmed=false 原因=version_expired 单价=0 总价=0（零金额不是免费确认价）
+   旧版登记结束 2026-07-31 尚未到，但实际有效结束 2026-07-12 已过；
+   结果的请求来源仍是旧版 seat-v1，账本没有自动改用新版确认
+
+⑤ 按受理时刻查询：
+   查询时刻=2026-07-18T09:00:00Z → 生效版本=seat-v2 单价=300 分 实际有效结束=无（持续有效）
+
+⑥ 受理时刻引用新版（quote-new-at-acceptance）：
+   请求 item=seat version=seat-v2 数量=5；首次受理时刻=2026-07-18T09:00:00Z
+   调用错误 err=<nil>
+   结果=已确认 Confirmed=true 原因="" 单价=300 分 总价=1500 分
+```
+
+对照输出中的查询时刻、所选版本、实际有效结束与报价首次受理时刻，即可看清两个报价为什么结果不同：
+
+- **③** 用的是**查询时刻** 7 月 8 日：那一刻旧版在实际有效期 `[07-01, 07-12)` 内，所以查到旧版。视图同时显示它的实际有效结束是 7 月 12 日——这次查询成功只回答“7 月 8 日谁生效”，不改变账本时钟，也不为随后的报价保留 240 分的旧费率。
+- **④** 用的是**首次受理时刻** 7 月 18 日 09:00：报价请求没有指定历史受理时间的参数，账本只按受理时刻判断，旧版的实际有效期已止于 7 月 12 日，所以被拒绝（`version_expired`）——尽管它登记的结束 7 月 31 日尚未到。结果的请求来源仍是旧版 `seat-v1`，账本没有自动改用新版确认。这笔拒绝的调用错误为 `nil`、`Confirmed=false`，单价和总价为零，零金额只是“没有可给出的金额”，不是免费确认价。
+- **⑤⑥** 在同一受理时刻按该时刻查询得到新版，换另一个未使用过的标识引用新版、数量 5，确认单价 300 分、总价 1500 分，确认结果的拒绝原因为空。④⑥ 两笔报价的首次受理时刻完全相同（都是 2026-07-18 09:00），结果不同只是因为引用的版本在受理时刻一个已失效、一个有效。
 
 ## 按时间范围查看生效版本
 
