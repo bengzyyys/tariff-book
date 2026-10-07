@@ -29,6 +29,7 @@ var (
 	ErrRequestNotFound    = errors.New("tariff: request id not found")
 	ErrRequestIDConflict  = errors.New("tariff: request id already used with different content")
 	ErrEmptyItemIDQuery   = errors.New("tariff: item id must not be empty")
+	ErrInvalidRange       = errors.New("tariff: range end must be after range start")
 )
 
 // RejectReason 区分报价被拒绝的原因。
@@ -350,6 +351,65 @@ func (b *Book) EffectiveVersionAt(itemID string, at time.Time) (VersionView, err
 		return VersionView{}, ErrNoEffectiveVersion
 	}
 	return versionView(found), nil
+}
+
+// ItemVersionsInRange 返回指定费率项在查询范围 [from, to) 内实际生效过的版本列表。
+//
+// 命中口径与 EffectiveVersionAt 相同，以查询时账本已经登记的实际有效区间
+// [EffectiveStart, EffectiveEnd) 为准：只有实际有效区间与查询范围存在交集的
+// 版本才会列出。范围包含开始时刻、不包含结束时刻；仅在边界处相接（范围结束
+// 恰好等于版本实际生效起点，或范围开始恰好等于版本实际结束）不算命中。
+// 实际结束为 nil 的版本按持续有效处理，与任何不早于其起点的范围都相交。
+//
+// 被替代的旧版本按截短后的实际结束判断：即使登记的结束时间仍落在范围内，
+// 交接点之后的那段也不会让旧版命中；替代它的新版本到期后旧版也不恢复。
+// 两版之间的空档不补入相邻版本。选择依据是查询时账本已登记的版本，范围可以
+// 在过去或未来，与账本时钟（WithClock）无关。
+//
+// 返回的列表沿用与 ItemVersions 相同的 VersionView：版本标识、整数分单价、
+// 登记起止、实际有效区间与替代关系（Replaces / SupersededBy）都原样保留，
+// 版本边界不会被改写成查询范围的边界。每个命中的版本只出现一次，按实际生效
+// 起点从早到晚排列（起点相同时按版本标识的字符串顺序）。查询只在指定费率项
+// 内进行，其他费率项中同名的版本不参与。
+//
+// 时间按实际时刻比较，同一瞬间用不同时区表示，结论一致。
+//
+// 结束时刻不晚于开始时刻时返回 ErrInvalidRange（可用 errors.Is 判别），
+// 不返回版本列表；范围合法但费率项从未登记过版本时返回 ErrItemNotFound；
+// 费率项存在但范围内没有命中版本时返回空列表且不报错。
+//
+// 该查询只读取版本信息：不受理报价、不占用请求标识，Quote、Lookup、
+// ItemVersions、EffectiveVersionAt 的既有规则和已保存的受理结果都不受影响。
+// 返回的列表及其中每个视图都是独立副本，调用方修改其中的结束时间不会改变
+// 账本，也不会影响后续查询与报价。
+func (b *Book) ItemVersionsInRange(itemID string, from, to time.Time) ([]VersionView, error) {
+	if !to.After(from) {
+		return nil, ErrInvalidRange
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	versions, ok := b.items[itemID]
+	if !ok || len(versions) == 0 {
+		return nil, ErrItemNotFound
+	}
+	views := make([]VersionView, 0, len(versions))
+	for _, v := range versions {
+		// 实际有效区间 [v.start, v.effEnd) 与查询范围 [from, to) 是否相交，
+		// 与登记时的重叠校验共用同一套半开区间判断。
+		if !intervalsOverlap(from, &to, v.start, v.effEnd) {
+			continue
+		}
+		views = append(views, versionView(v))
+	}
+	sort.Slice(views, func(i, j int) bool {
+		if !views[i].EffectiveStart.Equal(views[j].EffectiveStart) {
+			return views[i].EffectiveStart.Before(views[j].EffectiveStart)
+		}
+		return views[i].VersionID < views[j].VersionID
+	})
+	return views, nil
 }
 
 // Quote 按首次受理时刻判断指定版本是否有效并给出报价。
