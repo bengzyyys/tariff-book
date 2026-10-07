@@ -2160,6 +2160,272 @@ func fmtEnd(t *time.Time) string {
 - **⑦** 这组关系**不是** v1→v2→v3 依次替代的链：v2 和 v3 的 `Replaces` 都保留 `seat-v1`（各自登记时填写的来源，账本不改写），v3 的开始仍是 3 月 20 日、单价仍为 200 分、仍持续有效；v2 的 `被替代=""`，它与 v3 只是时间相接，互不替代。
 - **⑧** 按指定时刻选择只看**实际有效区间**：`[03-01, 03-10)` 选中 v1（150 分），3 月 10 日交接点（含）至 3 月 20 日前选中 v2（180 分），3 月 20 日交接点（含）起选中 v3（200 分）。到了 v1 登记结束 3 月 31 日当天也仍是 v3，不会因为 v3 “直接替代了 v1”之外还夹着 v2 而回退。
 
+## 填补费率版本之间的空档：Replaces 留空的登记
+
+前面几节的登记都在**替代旧版本**；还有一种常见情形：同一费率项的两段实际有效区间互不相邻、中间留着空档，事后补登记一个版本把空档填满。**填补空档不需要替代任何版本**：被补版本两侧的旧版各自保留登记起止、实际有效区间和替代关系，正确的登记方式是把新区间写成恰好填满空档、`Replaces` **留空**。
+
+选择登记方式时抓住以下规则：
+
+- **判定只看实际有效区间是否重叠，与登记顺序无关**：新版本的区间 `[Start, End)` 必须与同项每个既有版本的实际有效区间都不重叠；两端与邻版的边界落在同一瞬间是允许的——半开区间里一个版本的结束时刻与另一个版本的开始时刻相同属于**相接，不算重叠**（结束时刻不含）。版本列表始终按**生效时间**排列，因此先登记晚生效的版本、再回头补中间版本没有任何问题。
+- **空档在补登前真实存在**：补登之前用 `EffectiveVersionAt` 查询空档时刻返回 `tariff.ErrNoEffectiveVersion`（见上文“按指定时刻查询生效版本”），账本不会拿时间上邻近的版本补位；补登成功后，同一时刻返回新补登的版本。
+- **两侧旧版的边界都不移动**：没有 `Replaces` 就没有截断。补登成功后，左侧版本的结束、右侧版本的开始都保持原值，三版的 `Replaces` / `SupersededBy` 全部为空——时间相接不等于发生替代。
+
+### 两个容易填错的条件（就在这次操作旁边）
+
+- **不填结束时间会延伸进后一版的有效期，返回 `ErrOverlap`**：`End` 为 `nil` 表示持续有效，账本**不会自动以后一版的开始作为它的结束**。例如空档右侧的 v3 从 3 月 20 日起持续有效，补登的 v2 若只给 3 月 10 日开始、不填结束，区间就是 `[03-10, ∞)`，与 v3 的 `[03-20, ∞)` 重叠，登记失败。失败整次回滚：账本仍只有原来两版，空档查询仍返回 `ErrNoEffectiveVersion`；失败登记不占用版本标识，把结束补为 3 月 20 日后仍可用同一标识登记。
+- **把左侧版本填进 `Replaces` 会返回 `ErrInvalidReplacement`**：相接不等于替代。一旦填写 `Replaces`，新版本的 `Start` 就必须严格落在被替代版本**当前的实际有效区间** `[EffectiveStart, EffectiveEnd)` 内；当 `Start` 恰好等于左侧版本的实际结束时刻时，该点已经不在旧版有效期内（结束时刻不含），不能把“接在旧版后面”当作替代。补空档时把 `Replaces` 留空即可——既不需要、也不允许借替代来“接续”。
+
+### 一次先两次失败、再正确补齐空档的完整示例
+
+程序位于 [`examples/gapfill/main.go`](examples/gapfill/main.go)，可直接运行：
+
+```bash
+go run ./examples/gapfill
+```
+
+所有日期均为 2026 年 UTC 零点、结束时刻不含；账本初始化和费率数据全部在代码中给出。本示例只登记版本并按指定时刻查询、不调用 `Quote`：`RegisterVersion` 不读取账本时钟，`EffectiveVersionAt` 的查询时刻由调用方显式给出，所以即使直接 `tariff.NewBook()`（真实时钟），无论在哪一天运行输出都确定、可复现，读者无需注入时钟或补写初始化代码。生产环境其他场景直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一费率项 `seat`，**登记顺序是 v3、v1、v2**，而非按生效日期排列）：
+
+1. `seat-v3`：单价 200 分，2026-03-20 起持续有效（不填结束时间），`Replaces` 留空；
+2. `seat-v1`：单价 150 分，2026-03-01 开始、2026-03-10 结束（不含），`Replaces` 留空——两版之间在 `[03-10, 03-20)` 留下空档；
+3. 补登前查询：3 月 9 日返回 v1，3 月 15 日返回 `ErrNoEffectiveVersion`（不拿邻近版本补位），3 月 20 日 00:00（开始时刻含）已返回 v3；
+4. 第一次补登 `seat-v2`：单价 180 分、3 月 10 日开始，**不填结束时间**——区间延伸进 v3 的有效期，返回 `ErrOverlap`，账本不会自动以 v3 的开始作为结束；
+5. 第二次补登 `seat-v2`：把结束补为 3 月 20 日，却把 `seat-v1` 填进 `Replaces`——3 月 10 日已经不在 v1 的实际有效期 `[03-01, 03-10)` 内，返回 `ErrInvalidReplacement`；
+6. 两次失败后账本都仍只有 v1、v3，空档查询结论不变；第三次沿用标识 `seat-v2`，区间 `[03-10, 03-20)`、`Replaces` 留空，登记成功。
+
+```go
+// 命令 gapfill 是“填补费率版本之间的空档”的完整可运行示例：
+// 先登记的两版 seat-v3（2026-03-20 起持续有效）与 seat-v1
+// （2026-03-01 至 2026-03-10）在 [03-10, 03-20) 之间留下空档，
+// 查询空档得到 ErrNoEffectiveVersion，账本不会拿邻近版本补位。
+// 补登 seat-v2 时，第一次不填结束时间会延伸进 v3 的有效期，返回 ErrOverlap，
+// 账本不会自动以 v3 的开始作为结束；第二次把 v1 填进 Replaces，
+// 但 3 月 10 日已经不在 v1 的实际有效期内，返回 ErrInvalidReplacement，
+// “接在旧版后面”不是替代。两次失败后账本都仍是原来的两版。
+// 最后把 v2 登记为 [2026-03-10, 2026-03-20)、Replaces 留空，恰好补齐空档：
+// 不截断、不替代任何旧版，三版按生效时间排列为 v1、v2、v3。
+//
+// 运行：
+//
+//	go run ./examples/gapfill
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指 2026 年 UTC 零点，结束时刻不含。
+var (
+	v1Start = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)  // v1 生效起点（含）
+	v1End   = time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC) // v1 结束时刻（不含），也是空档起点
+	v2Start = v1End
+	v2End   = time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC) // v2 结束时刻（不含），也是 v3 起点
+	v3Start = v2End
+	gapAt   = time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC) // 空档内部
+)
+
+func main() {
+	// 本示例只登记版本并按指定时刻查询，不调用 Quote：
+	// RegisterVersion 不读账本时钟，EffectiveVersionAt 的查询时刻由调用方显式给出，
+	// 因此即使直接 NewBook()（真实时钟），输出也完全确定、与运行当天无关。
+	book := tariff.NewBook()
+
+	// ① 先登记 seat-v3：单价 200 分，2026-03-20 起持续有效（不填结束时间），
+	//    不替代任何版本（Replaces 留空）。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v3",
+		UnitPrice: 200,
+		Start:     v3Start,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("① 登记 seat-v3：单价 200 分，2026-03-20T00:00:00Z 起持续有效，Replaces 留空，err=<nil>")
+
+	// ② 再登记 seat-v1：单价 150 分，2026-03-01 生效，2026-03-10 结束（不含），
+	//    同样不替代任何版本。登记顺序是先 v3 后 v1。
+	v1RegisteredEnd := v1End
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 150,
+		Start:     v1Start,
+		End:       &v1RegisteredEnd,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("② 登记 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z)，Replaces 留空，err=<nil>")
+
+	// ③ 版本列表按生效时间排列为 v1、v3，而不是登记顺序 v3、v1；
+	//    两版的登记起止与实际有效区间一致，替代与被替代关系均为空。
+	printViews(book, "③ 两版登记完成后的版本视图（按生效时间排列，而非登记顺序）")
+
+	// ④ 补登前按时刻查询：
+	//    3 月 9 日落在 v1 内；3 月 15 日落在两版之间的空档 [03-10, 03-20)，
+	//    返回 ErrNoEffectiveVersion——账本不会拿时间上邻近的 v1 或 v3 补位；
+	//    3 月 20 日（开始时刻含）已是 v3。
+	fmt.Println("④ 补登 v2 前按时刻查询：")
+	printAt(book, time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC))
+	printAt(book, gapAt)
+	printAt(book, v3Start)
+
+	// ⑤ 第一次尝试补登 seat-v2：单价 180 分，2026-03-10 起，Replaces 留空，
+	//    但不填结束时间。它的实际有效区间会是 [03-10, ∞)，延伸进 v3 的
+	//    [03-20, ∞)；填补空档不需要替代任何版本，账本也不会自动以 v3 的开始
+	//    作为 v2 的结束，因此返回 ErrOverlap。
+	err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+	})
+	fmt.Printf("⑤ 登记 seat-v2（不填结束时间，Replaces 留空）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrOverlap) = %v；登记失败是调用本身返回错误，整次登记未生效\n",
+		errors.Is(err, tariff.ErrOverlap))
+
+	// ⑥ 失败后整次回滚：仍只有 v1、v3 两个版本，v2 未入库、标识未被占用，
+	//    v1 的结束（3 月 10 日）和 v3 的开始（3 月 20 日）都保持原值、关系全空；
+	//    空档查询的结论不变。
+	printViews(book, "⑥ 第一次失败后的版本视图（仍只有 v1、v3，边界与关系不变）")
+	printAt(book, gapAt)
+
+	// ⑦ 第二次尝试补登 seat-v2：这次把结束时间填为 3 月 20 日，却把 v1 填进
+	//    Replaces。v1 的实际有效区间是 [03-01, 03-10)，3 月 10 日恰好等于它的
+	//    实际结束时刻——结束时刻不含，该点已经不在 v1 的实际有效期内。
+	//    v2 只是时间上接在 v1 后面，并不替代 v1，因此返回 ErrInvalidReplacement。
+	v2RegisteredEnd := v2End
+	err = book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		End:       &v2RegisteredEnd,
+		Replaces:  "seat-v1",
+	})
+	fmt.Printf("⑦ 登记 seat-v2（结束=2026-03-20，但 Replaces 填 seat-v1）：err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrInvalidReplacement) = %v；"+
+		"3 月 10 日不在 v1 的实际有效期 [03-01, 03-10) 内，“接在旧版后面”不是替代\n",
+		errors.Is(err, tariff.ErrInvalidReplacement))
+
+	// ⑧ 第二次失败同样整次回滚：账本仍只有 v1、v3，边界与替代关系不变。
+	printViews(book, "⑧ 第二次失败后的版本视图（仍只有 v1、v3，边界与关系不变）")
+
+	// ⑨ 第三次用同一个标识 seat-v2 正确补登：单价 180 分，
+	//    [2026-03-10, 2026-03-20) 恰好填满空档，Replaces 留空。
+	//    两侧端点与既有版本相接：半开区间端点相接不算重叠，登记成功；
+	//    失败的登记不占用版本标识，因此 seat-v2 仍可使用。
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		End:       &v2RegisteredEnd,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("⑨ 补登 seat-v2：单价 180 分，[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)，Replaces 留空：err=<nil>，登记生效")
+
+	// ⑩ 补登成功后的版本视图：按生效时间排列为 v1、v2、v3（登记顺序是 v3、v1、v2）；
+	//    三版登记的起止时间与实际有效区间完全一致，替代与被替代关系全部为空；
+	//    v1 的结束仍是 3 月 10 日、v3 的开始仍是 3 月 20 日，二者都没有被移动。
+	printViews(book, "⑩ 补登成功后的版本视图（v1、v2、v3，替代关系全空）")
+
+	// ⑪ 再次按时刻查询：原来的空档时刻现在返回 v2、单价 180 分；
+	//    3 月 10 日交接点（开始时刻含）属于 v2，3 月 20 日交接点属于 v3，
+	//    结束时刻不含、开始时刻包含；时间相接没有产生任何替代关系。
+	fmt.Println("⑪ 补登后按时刻查询（开始时刻包含、结束时刻不包含）：")
+	printAt(book, time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC))
+	printAt(book, v2Start)
+	printAt(book, gapAt)
+	printAt(book, v3Start)
+	printAt(book, time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC))
+}
+
+func printViews(book *tariff.Book, title string) {
+	fmt.Printf("%s：\n", title)
+	views, err := book.ItemVersions("seat")
+	if err != nil {
+		panic(err)
+	}
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 开始=%s 登记结束=%s 实际有效结束=%s 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice, v.Start.Format(time.RFC3339),
+			fmtEnd(v.End), fmtEnd(v.EffectiveEnd), v.Replaces, v.SupersededBy)
+	}
+}
+
+func printAt(book *tariff.Book, at time.Time) {
+	v, err := book.EffectiveVersionAt("seat", at)
+	if errors.Is(err, tariff.ErrNoEffectiveVersion) {
+		fmt.Printf("   查询 %s：无生效版本（%v），账本不拿邻近版本补位\n", at.Format(time.RFC3339), err)
+		return
+	}
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("   查询 %s：%s（单价=%d，实际有效区间 [%s, %s)）\n",
+		at.Format(time.RFC3339), v.VersionID, v.UnitPrice,
+		v.EffectiveStart.Format(time.RFC3339), fmtEnd(v.EffectiveEnd))
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+```
+
+输出（全部由代码中写死的 2026 年 UTC 时刻决定，不依赖真实日期，也不依赖账本时钟）：
+
+```text
+① 登记 seat-v3：单价 200 分，2026-03-20T00:00:00Z 起持续有效，Replaces 留空，err=<nil>
+② 登记 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z)，Replaces 留空，err=<nil>
+③ 两版登记完成后的版本视图（按生效时间排列，而非登记顺序）：
+   seat-v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-10T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代=""
+   seat-v3：单价=200 开始=2026-03-20T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+④ 补登 v2 前按时刻查询：
+   查询 2026-03-09T00:00:00Z：seat-v1（单价=150，实际有效区间 [2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z)）
+   查询 2026-03-15T00:00:00Z：无生效版本（tariff: no effective version for the rate item at the given time），账本不拿邻近版本补位
+   查询 2026-03-20T00:00:00Z：seat-v3（单价=200，实际有效区间 [2026-03-20T00:00:00Z, 无（持续有效）)）
+⑤ 登记 seat-v2（不填结束时间，Replaces 留空）：err=tariff: version interval overlaps an existing version of the item
+   errors.Is(err, tariff.ErrOverlap) = true；登记失败是调用本身返回错误，整次登记未生效
+⑥ 第一次失败后的版本视图（仍只有 v1、v3，边界与关系不变）：
+   seat-v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-10T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代=""
+   seat-v3：单价=200 开始=2026-03-20T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+   查询 2026-03-15T00:00:00Z：无生效版本（tariff: no effective version for the rate item at the given time），账本不拿邻近版本补位
+⑦ 登记 seat-v2（结束=2026-03-20，但 Replaces 填 seat-v1）：err=tariff: new version start must be after the replaced version start and within its current effective interval
+   errors.Is(err, tariff.ErrInvalidReplacement) = true；3 月 10 日不在 v1 的实际有效期 [03-01, 03-10) 内，“接在旧版后面”不是替代
+⑧ 第二次失败后的版本视图（仍只有 v1、v3，边界与关系不变）：
+   seat-v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-10T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代=""
+   seat-v3：单价=200 开始=2026-03-20T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+⑨ 补登 seat-v2：单价 180 分，[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)，Replaces 留空：err=<nil>，登记生效
+⑩ 补登成功后的版本视图（v1、v2、v3，替代关系全空）：
+   seat-v1：单价=150 开始=2026-03-01T00:00:00Z 登记结束=2026-03-10T00:00:00Z 实际有效结束=2026-03-10T00:00:00Z 替代="" 被替代=""
+   seat-v2：单价=180 开始=2026-03-10T00:00:00Z 登记结束=2026-03-20T00:00:00Z 实际有效结束=2026-03-20T00:00:00Z 替代="" 被替代=""
+   seat-v3：单价=200 开始=2026-03-20T00:00:00Z 登记结束=无（持续有效） 实际有效结束=无（持续有效） 替代="" 被替代=""
+⑪ 补登后按时刻查询（开始时刻包含、结束时刻不包含）：
+   查询 2026-03-09T00:00:00Z：seat-v1（单价=150，实际有效区间 [2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z)）
+   查询 2026-03-10T00:00:00Z：seat-v2（单价=180，实际有效区间 [2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)）
+   查询 2026-03-15T00:00:00Z：seat-v2（单价=180，实际有效区间 [2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)）
+   查询 2026-03-20T00:00:00Z：seat-v3（单价=200，实际有效区间 [2026-03-20T00:00:00Z, 无（持续有效）)）
+   查询 2026-04-01T00:00:00Z：seat-v3（单价=200，实际有效区间 [2026-03-20T00:00:00Z, 无（持续有效）)）
+```
+
+对照输出即可选择正确的登记方式并核对结果：
+
+- **③** 版本按**生效时间**列为 v1、v3，尽管登记顺序是先 v3 后 v1；两版的登记起止与实际有效区间一致，替代关系为空。
+- **④** 补登前 3 月 15 日返回 `ErrNoEffectiveVersion`：空档里没有生效版本，账本不会拿邻近的 v1 或 v3 补位；3 月 9 日选 v1，3 月 20 日 00:00 因开始时刻包含已选 v3。
+- **⑤⑥** v2 不填结束时间时区间是 `[03-10, ∞)`，与持续有效的 v3 重叠，返回 `ErrOverlap`——账本**不会**自动以 v3 的开始（3 月 20 日）作为 v2 的结束。失败整次回滚：账本仍只有 v1、v3，v1 的结束和 v3 的开始都保持原值，空档查询结论不变。
+- **⑦⑧** 把 `seat-v1` 填进 `Replaces` 返回 `ErrInvalidReplacement`：v1 的实际有效区间是 `[03-01, 03-10)`，3 月 10 日是它的结束时刻（不含），v2 只是**接在** v1 后面，并没有替代它。这次失败同样回滚，账本状态与操作前一致。
+- **⑨⑩** 正确方式是区间恰好填满空档、`Replaces` 留空：两端与邻版边界相接（半开区间相接不算重叠），登记成功。失败登记不占用标识，所以仍可用 `seat-v2`。补登后列表按生效时间为 v1、v2、v3；三版登记起止与实际有效区间一致，`Replaces` / `SupersededBy` 全空——v1 的结束仍是 3 月 10 日、v3 的开始仍是 3 月 20 日，都没有被移动。
+- **⑪** 原空档时刻改返回 v2、单价 180 分；3 月 10 日交接点属于 v2、3 月 20 日交接点属于 v3：开始时刻包含、结束时刻不包含，两版与 v2 只是时间相接，没有发生替代。
+
 ## 不同费率项使用同名版本时，怎样登记替代版本
 
 版本标识只在**同一费率项内**唯一：同一本账本允许 `seat` 和 `room` 各自登记一个名为 `v1` 的版本，两者单价、有效期可以不同，跨费率项的有效期重叠也不是冲突。登记替代版本时，`Replaces` 填的只是版本标识，替代来源按**本次登记指定的费率项**（`RegisterRequest.ItemID`）查找：
