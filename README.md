@@ -346,6 +346,232 @@ views, err := book.VersionsInRange("seat", from, to)
 
 该查询只读取版本信息：**不受理报价、不占用请求标识**，也不改写费率或已保存的受理结果，`Quote`、`Lookup`、`ItemVersions`、`EffectiveVersionAt` 的既有规则都不受影响。返回的视图是独立副本，调用方改写其中的结束时间不会影响后续查询和报价。
 
+### 三段范围查询的完整示例
+
+程序位于 [`examples/inrange/main.go`](examples/inrange/main.go)，可直接运行：
+
+```bash
+go run ./examples/inrange
+```
+
+所有日期均为 2026 年 UTC 零点、结束时刻不含；账本初始化和所需费率登记全部在代码中给出。本示例只登记版本并按调用方给出的时间范围查询、不调用 `Quote`：`RegisterVersion` 不读取账本时钟，`VersionsInRange` 的 `from`/`to` 也由调用方显式给出，所以即使直接 `tariff.NewBook()`（真实时钟），无论在哪一天运行输出都确定、可复现，读者无需注入时钟或补写初始化代码。生产环境其他场景直接 `tariff.NewBook()` 即使用真实时间。
+
+时间线（同一费率项 `seat`）：
+
+1. 旧版 `seat-v1`：单价 150 分，2026-03-01 开始，登记结束为 2026-03-31（不含）；
+2. 新版 `seat-v2`：单价 180 分，2026-03-10 起替代旧版，登记结束为 2026-03-20（不含）——旧版的登记结束仍是 3 月 31 日，实际有效结束被截短到 3 月 10 日；
+3. 分别查看 3 月 9 日至 11 日、3 月 10 日至 25 日、3 月 20 日至 25 日：第一段按生效先后列出旧版和新版，第二段只列新版，第三段是没有命中版本的空列表；
+4. 再区分两类调用失败：结束不晚于开始返回 `ErrInvalidRange`（即使费率项不存在也优先），范围合法但费率项从未登记返回 `ErrItemNotFound`。
+
+```go
+// 命令 inrange 是“按时间范围查看生效版本”的完整可运行示例：
+// 同一费率项 seat 的旧版 seat-v1（单价 150 分，2026-03-01 开始、登记结束 2026-03-31）
+// 被新版 seat-v2（单价 180 分，2026-03-10 起替代旧版、2026-03-20 结束）截短实际有效期；
+// 分别查看 3 月 9 日至 11 日、3 月 10 日至 25 日、3 月 20 日至 25 日，
+// 并区分合法范围的空结果与 ErrInvalidRange、ErrItemNotFound 两类调用失败。
+//
+// 运行：
+//
+//	go run ./examples/inrange
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bengzyyys/tariff-book/tariff"
+)
+
+// 下述日期均指 2026 年 UTC 零点，结束时刻不含。
+var (
+	v1Start = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)  // 旧版生效起点（含）
+	v1End   = time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC) // 旧版登记结束（不含）
+	v2Start = time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC) // 新版生效起点，也是旧版实际结束（不含）
+	v2End   = time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC) // 新版结束时刻（不含）
+)
+
+func main() {
+	// 本示例只登记版本并按调用方给出的时间范围查询，不调用 Quote：
+	// RegisterVersion 不读账本时钟，VersionsInRange 的 from/to 也由调用方显式给出，
+	// 因此即使直接 NewBook()（真实时钟），无论在哪一天运行输出都确定、可复现，
+	// 读者无需注入时钟或补写初始化代码。
+	book := tariff.NewBook()
+
+	// ① 登记旧版 seat-v1：单价 150 分，2026-03-01 生效，登记结束 2026-03-31（不含）。
+	v1RegisteredEnd := v1End
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v1",
+		UnitPrice: 150,
+		Start:     v1Start,
+		End:       &v1RegisteredEnd,
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("① 登记旧版 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)，err=<nil>")
+
+	// ② 登记新版 seat-v2：单价 180 分，2026-03-10 起替代旧版，登记结束 2026-03-20（不含）。
+	//    从交接时刻起旧版的实际有效区间被截短为 [03-01, 03-10)，
+	//    但它登记时填写的结束 3 月 31 日原样保留——两种结束不是同一个值。
+	v2RegisteredEnd := v2End
+	if err := book.RegisterVersion(tariff.RegisterRequest{
+		ItemID:    "seat",
+		VersionID: "seat-v2",
+		UnitPrice: 180,
+		Start:     v2Start,
+		End:       &v2RegisteredEnd,
+		Replaces:  "seat-v1",
+	}); err != nil {
+		panic(err)
+	}
+	fmt.Println("② 登记新版 seat-v2：单价 180 分，2026-03-10T00:00:00Z 起替代 seat-v1，登记结束 2026-03-20T00:00:00Z（不含），err=<nil>")
+	printViews(book)
+
+	// ③ 范围 [03-09, 03-11) 跨过交接点：旧版按截短后的实际结束 3 月 10 日参与，
+	//    与范围在 [03-09, 03-10) 相交；新版与范围在 [03-10, 03-11) 相交。
+	//    两版都列出，按实际生效起点先旧后新。
+	printRange(book, "③",
+		time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 11, 0, 0, 0, 0, time.UTC))
+
+	// ④ 范围 [03-10, 03-25) 从交接点开始：旧版实际结束恰好等于范围开始，
+	//    只是边界相接、不命中；只有新版与范围相交——即使范围一直延伸到新版结束之后，
+	//    后面的空档也不会补入任何版本。
+	printRange(book, "④", v2Start,
+		time.Date(2026, 3, 25, 0, 0, 0, 0, time.UTC))
+
+	// ⑤ 范围 [03-20, 03-25) 从新版结束时刻开始：新版只是边界相接、不命中，
+	//    旧版也不会在新版结束后恢复——空列表、不报错，账本不拿邻近版本补位。
+	printRange(book, "⑤", v2End,
+		time.Date(2026, 3, 25, 0, 0, 0, 0, time.UTC))
+
+	// ⑥ 结束不晚于开始：返回 ErrInvalidRange，不返回版本列表。
+	//    这是调用失败，不是“范围内没有生效版本”（对照⑤的空列表、nil 错误）。
+	at := time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC)
+	got, err := book.VersionsInRange("seat", at, at)
+	fmt.Printf("⑥ 结束不晚于开始（费率项 seat，from=to=%s）：\n", at.Format(time.RFC3339))
+	fmt.Printf("   err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrInvalidRange) = %v；返回列表为 nil：%v（调用失败，不给版本列表）\n\n",
+		errors.Is(err, tariff.ErrInvalidRange), got == nil)
+
+	// ⑦ 范围合法，但费率项从未登记过版本：返回 ErrItemNotFound。
+	from := time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 3, 11, 0, 0, 0, 0, time.UTC)
+	got, err = book.VersionsInRange("never-seen", from, to)
+	fmt.Printf("⑦ 范围合法但费率项从未登记（费率项 never-seen，[%s, %s)）：\n",
+		from.Format(time.RFC3339), to.Format(time.RFC3339))
+	fmt.Printf("   err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrItemNotFound) = %v；返回列表为 nil：%v\n\n",
+		errors.Is(err, tariff.ErrItemNotFound), got == nil)
+
+	// ⑧ 不存在的费率项同时使用非法范围：范围错误优先，仍返回 ErrInvalidRange，
+	//    不会落到 ErrItemNotFound。
+	got, err = book.VersionsInRange("never-seen", at, at)
+	fmt.Printf("⑧ 不存在的费率项同时使用非法范围（费率项 never-seen，from=to=%s）：\n",
+		at.Format(time.RFC3339))
+	fmt.Printf("   err=%v\n", err)
+	fmt.Printf("   errors.Is(err, tariff.ErrInvalidRange) = %v；errors.Is(err, tariff.ErrItemNotFound) = %v（范围错误优先）\n",
+		errors.Is(err, tariff.ErrInvalidRange), errors.Is(err, tariff.ErrItemNotFound))
+	fmt.Printf("   返回列表为 nil：%v\n", got == nil)
+}
+
+// printViews 打印登记完成后账本保存的完整版本视图。
+func printViews(book *tariff.Book) {
+	fmt.Println("登记后的版本视图：")
+	views, err := book.ItemVersions("seat")
+	if err != nil {
+		panic(err)
+	}
+	for _, v := range views {
+		fmt.Printf("   %s：单价=%d 分 登记区间=[%s, %s) 实际有效区间=[%s, %s) 替代=%q 被替代=%q\n",
+			v.VersionID, v.UnitPrice,
+			v.Start.Format(time.RFC3339), fmtEnd(v.End),
+			v.EffectiveStart.Format(time.RFC3339), fmtEnd(v.EffectiveEnd),
+			v.Replaces, v.SupersededBy)
+	}
+	fmt.Println()
+}
+
+// printRange 执行一次范围查询并打印命中明细；
+// 表头同时给出费率项与半开范围 [from, to)，让读者一眼看出查的是哪个项、哪段时间。
+// 命中记录显示版本标识、整数分单价、登记起止时间和实际有效区间，
+// 这些都是账本保存的原值，不会被裁成查询范围的边界。
+func printRange(book *tariff.Book, label string, from, to time.Time) {
+	fmt.Printf("%s 查询费率项 seat 在 [%s, %s) 内生效过的版本：\n",
+		label, from.Format(time.RFC3339), to.Format(time.RFC3339))
+	views, err := book.VersionsInRange("seat", from, to)
+	if err != nil {
+		fmt.Printf("   调用失败：err=%v\n\n", err)
+		return
+	}
+	fmt.Printf("   命中 %d 个（err=%v），按实际生效起点从早到晚排列：\n", len(views), err)
+	if len(views) == 0 {
+		fmt.Println("   空列表：合法范围内没有命中任何版本（新版结束后旧版不恢复，空档不补入邻近版本），这不是调用失败")
+		fmt.Println()
+		return
+	}
+	for _, v := range views {
+		fmt.Printf("   - %s：单价=%d 分 登记区间=[%s, %s) 实际有效区间=[%s, %s)\n",
+			v.VersionID, v.UnitPrice,
+			v.Start.Format(time.RFC3339), fmtEnd(v.End),
+			v.EffectiveStart.Format(time.RFC3339), fmtEnd(v.EffectiveEnd))
+	}
+	fmt.Println()
+}
+
+func fmtEnd(t *time.Time) string {
+	if t == nil {
+		return "无（持续有效）"
+	}
+	return t.Format(time.RFC3339)
+}
+```
+
+输出（所有时刻都由代码中写死的 2026 年 UTC 时间给出，查询时间由调用方明确给出，不随运行当天变化）：
+
+```text
+① 登记旧版 seat-v1：单价 150 分，[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z)，err=<nil>
+② 登记新版 seat-v2：单价 180 分，2026-03-10T00:00:00Z 起替代 seat-v1，登记结束 2026-03-20T00:00:00Z（不含），err=<nil>
+登记后的版本视图：
+   seat-v1：单价=150 分 登记区间=[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z) 实际有效区间=[2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z) 替代="" 被替代="seat-v2"
+   seat-v2：单价=180 分 登记区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z) 实际有效区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z) 替代="seat-v1" 被替代=""
+
+③ 查询费率项 seat 在 [2026-03-09T00:00:00Z, 2026-03-11T00:00:00Z) 内生效过的版本：
+   命中 2 个（err=<nil>），按实际生效起点从早到晚排列：
+   - seat-v1：单价=150 分 登记区间=[2026-03-01T00:00:00Z, 2026-03-31T00:00:00Z) 实际有效区间=[2026-03-01T00:00:00Z, 2026-03-10T00:00:00Z)
+   - seat-v2：单价=180 分 登记区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z) 实际有效区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)
+
+④ 查询费率项 seat 在 [2026-03-10T00:00:00Z, 2026-03-25T00:00:00Z) 内生效过的版本：
+   命中 1 个（err=<nil>），按实际生效起点从早到晚排列：
+   - seat-v2：单价=180 分 登记区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z) 实际有效区间=[2026-03-10T00:00:00Z, 2026-03-20T00:00:00Z)
+
+⑤ 查询费率项 seat 在 [2026-03-20T00:00:00Z, 2026-03-25T00:00:00Z) 内生效过的版本：
+   命中 0 个（err=<nil>），按实际生效起点从早到晚排列：
+   空列表：合法范围内没有命中任何版本（新版结束后旧版不恢复，空档不补入邻近版本），这不是调用失败
+
+⑥ 结束不晚于开始（费率项 seat，from=to=2026-03-15T00:00:00Z）：
+   err=tariff: range end must be after range start
+   errors.Is(err, tariff.ErrInvalidRange) = true；返回列表为 nil：true（调用失败，不给版本列表）
+
+⑦ 范围合法但费率项从未登记（费率项 never-seen，[2026-03-09T00:00:00Z, 2026-03-11T00:00:00Z)）：
+   err=tariff: rate item not found
+   errors.Is(err, tariff.ErrItemNotFound) = true；返回列表为 nil：true
+
+⑧ 不存在的费率项同时使用非法范围（费率项 never-seen，from=to=2026-03-15T00:00:00Z）：
+   err=tariff: range end must be after range start
+   errors.Is(err, tariff.ErrInvalidRange) = true；errors.Is(err, tariff.ErrItemNotFound) = false（范围错误优先）
+   返回列表为 nil：true
+```
+
+对照输出即可读懂这条查询口径：
+
+- **③** 范围 `[03-09, 03-11)` 跨过 3 月 10 日交接点，按实际生效起点先后列出旧版、新版。旧版是**按实际结束 3 月 10 日**参与查询的：它的实际有效区间 `[03-01, 03-10)` 与范围在 3 月 9 日当天相交才被列入；返回的又是**账本保存的版本信息**，起止时间不会被裁成查询范围——旧版仍从 3 月 1 日开始、登记结束仍是 3 月 31 日，只有“实际有效结束”才是 3 月 10 日，两者并排显示、含义不同。
+- **④** 范围从交接点 3 月 10 日开始：旧版实际结束恰好等于范围开始，半开区间只在边界相接，不算命中，所以只列新版。范围一直延伸到 3 月 25 日（越过新版 3 月 20 日的结束）也只列新版一次，**新版结束后的空档不会补入邻近版本**；新版的登记起止同样保持 `[03-10, 03-20)`，没有被裁成范围结束。
+- **⑤** 范围从新版结束时刻开始，新版只是相接、不命中，且**旧版不会在新版结束后恢复**，结果是空列表、`err=<nil>`：这是合法范围内的正常空结果，不能显示成“没有生效版本”的错误。
+- **⑥⑦⑧** 是两种调用失败，与 ⑤ 的空结果必须分开：⑥ 结束不晚于开始返回 `ErrInvalidRange` 且**不给版本列表**；⑦ 范围合法但费率项从未登记返回 `ErrItemNotFound`；⑧ 不存在的费率项同时使用非法范围时仍是 `ErrInvalidRange`、`errors.Is(err, ErrItemNotFound)` 为假——**范围错误优先**。⑤ 的“空列表 + 无错误”与这三者都不同。
+- 整个示例只调用 `RegisterVersion`、`ItemVersions` 和 `VersionsInRange`：查询时间全部由调用方在代码中明确给出，输出不随运行当天变化；查询本身**不会生成报价或改写已保存的报价结果**，`Quote`、`Lookup` 等既有入口的行为完全不变。
+
 ## 完整示例
 
 下面的程序围绕同一费率项 `seat` 演示完整核对过程，代码位于
